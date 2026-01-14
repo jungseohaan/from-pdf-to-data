@@ -1,0 +1,2553 @@
+"""PDF 문항 수작업 박싱 및 레이블링 도구 (PyQt5)"""
+
+import json
+import sys
+from pathlib import Path
+from typing import List, Optional, Dict
+from dataclasses import dataclass, asdict
+from datetime import datetime
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QListWidget, QFileDialog,
+    QMessageBox, QScrollArea, QGroupBox, QSplitter,
+    QMenuBar, QMenu, QAction, QComboBox, QInputDialog, QColorDialog,
+    QListWidgetItem, QAbstractItemView, QWidgetAction
+)
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QWheelEvent, QIcon, QDrag
+from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, QSettings, QTimer, QMimeData
+
+from PIL import Image
+from pdf2image import convert_from_path
+
+
+@dataclass
+class Theme:
+    """테마/단원 정보"""
+    id: str
+    name: str
+    color: str = "#3498db"  # 기본 파란색
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# 박스 유형 상수
+BOX_TYPE_QUESTION = "question"  # 문제
+BOX_TYPE_SOLUTION = "solution"  # 풀이
+
+
+@dataclass
+class QuestionBox:
+    """문항 박스 정보"""
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    number: Optional[int] = None
+    theme_id: Optional[str] = None  # 테마 ID로 연결
+    page: int = 1
+    box_type: str = BOX_TYPE_QUESTION  # 문제 또는 풀이
+    linked_box_id: Optional[str] = None  # 연결된 박스 ID (풀이→문제)
+    box_id: Optional[str] = None  # 고유 ID
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class ScrollAreaWithPageNav(QScrollArea):
+    """스크롤 경계에서 페이지 이동을 지원하는 커스텀 스크롤 영역"""
+
+    page_next = pyqtSignal()
+    page_prev = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.at_bottom_count = 0
+        self.at_top_count = 0
+        self.scroll_threshold = 5  # 5번 연속 스크롤 시 페이지 이동 (민감도 낮춤)
+        self._last_scroll_time = 0
+        self._scroll_timeout = 500  # 500ms 내에 스크롤해야 카운트 유지
+
+    def wheelEvent(self, event: QWheelEvent):
+        """휠 이벤트 처리 - 경계에서 추가 스크롤 시 페이지 이동"""
+        import time
+        current_time = int(time.time() * 1000)
+
+        # 시간 초과 시 카운트 리셋
+        if current_time - self._last_scroll_time > self._scroll_timeout:
+            self.at_bottom_count = 0
+            self.at_top_count = 0
+        self._last_scroll_time = current_time
+
+        scrollbar = self.verticalScrollBar()
+        delta = event.angleDelta().y()
+
+        at_top = scrollbar.value() == scrollbar.minimum()
+        at_bottom = scrollbar.value() == scrollbar.maximum()
+
+        # 아래로 스크롤 (delta < 0)
+        if delta < 0:
+            if at_bottom:
+                self.at_bottom_count += 1
+                self.at_top_count = 0
+                if self.at_bottom_count >= self.scroll_threshold:
+                    self.page_next.emit()
+                    self.at_bottom_count = 0
+                    # 다음 페이지로 이동 후 맨 위로
+                    scrollbar.setValue(scrollbar.minimum())
+                    event.accept()
+                    return
+            else:
+                self.at_bottom_count = 0
+
+        # 위로 스크롤 (delta > 0)
+        elif delta > 0:
+            if at_top:
+                self.at_top_count += 1
+                self.at_bottom_count = 0
+                if self.at_top_count >= self.scroll_threshold:
+                    self.page_prev.emit()
+                    self.at_top_count = 0
+                    # 이전 페이지로 이동 후 맨 아래로
+                    scrollbar.setValue(scrollbar.maximum())
+                    event.accept()
+                    return
+            else:
+                self.at_top_count = 0
+
+        # 기본 스크롤 동작
+        super().wheelEvent(event)
+
+
+class ThemeListWidget(QListWidget):
+    """드롭을 지원하는 테마 목록 위젯"""
+
+    box_dropped = pyqtSignal(str)  # theme_id를 전달
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        """드래그 진입 시"""
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        """드래그 이동 중 - 테마 항목 위에서만 허용"""
+        if event.mimeData().hasText():
+            item = self.itemAt(event.pos())
+            if item and item.data(Qt.UserRole):  # 테마 ID가 있는 항목만
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        """드롭 시 - 테마에 박스 할당"""
+        if event.mimeData().hasText():
+            item = self.itemAt(event.pos())
+            if item:
+                theme_id = item.data(Qt.UserRole)
+                if theme_id:
+                    # 드롭된 박스 인덱스 전달
+                    self.box_dropped.emit(theme_id)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+
+class BoxListWidget(QListWidget):
+    """멀티 선택과 드래그를 지원하는 박스 목록 위젯"""
+
+    # 테마 변경 시그널: (box_items: list of (page_idx, box), theme_id)
+    theme_changed = pyqtSignal(list, object)
+    # 테마 선택 시그널 (더블클릭 팝업용): (list_rows, theme_id)
+    theme_selected = pyqtSignal(list, object)
+    # 타입 변경 시그널: (box_items: list of (page_idx, box), box_type)
+    type_changed = pyqtSignal(list, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setAcceptDrops(True)  # 드롭 허용
+        self.viewport().setAcceptDrops(True)  # viewport도 드롭 허용
+        self.setContextMenuPolicy(Qt.CustomContextMenu)  # 우클릭 메뉴
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        self._parent_window = None
+        self._collapsed_themes = set()
+        self._dragging = False
+        self._drag_start_pos = None
+        self._highlighted_row = -1
+        self._original_bg = None
+
+    def set_parent_window(self, parent_window):
+        """부모 윈도우 설정"""
+        self._parent_window = parent_window
+
+    def _get_box_index_map(self):
+        """안전하게 _box_index_map 가져오기"""
+        if self._parent_window and hasattr(self._parent_window, '_box_index_map'):
+            return self._parent_window._box_index_map
+        return []
+
+    def _is_header_row(self, row):
+        """해당 행이 테마 헤더인지 확인"""
+        box_map = self._get_box_index_map()
+        if 0 <= row < len(box_map):
+            return box_map[row] is None
+        return False
+
+    def _get_selected_boxes(self):
+        """선택된 박스들 반환 (헤더 제외) - (page_idx, box) 튜플 리스트"""
+        result = []
+        box_map = self._get_box_index_map()
+        for item in self.selectedItems():
+            row = self.row(item)
+            if 0 <= row < len(box_map) and box_map[row] is not None:
+                result.append(box_map[row])
+        return result
+
+    def _get_theme_id_from_header(self, item):
+        """헤더 아이템에서 테마 ID 추출"""
+        if not self._parent_window:
+            return None
+        header_text = item.text()
+        if "(미지정)" in header_text:
+            return None
+        for theme in self._parent_window.themes:
+            if theme.name in header_text:
+                return theme.id
+        return None
+
+    def mousePressEvent(self, event):
+        """마우스 누름 - 헤더 클릭시 접기/펼치기, 드래그 시작점 기록"""
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(event.pos())
+            if item:
+                row = self.row(item)
+                # 테마 헤더 클릭 - 접기/펼치기
+                if self._is_header_row(row):
+                    self._toggle_theme(item)
+                    return  # 헤더 클릭은 선택 등 기본 동작 막음
+            self._drag_start_pos = event.pos()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """마우스 이동 - 드래그 시작"""
+        if not (event.buttons() & Qt.LeftButton):
+            return
+        if self._drag_start_pos is None:
+            return
+
+        # 최소 드래그 거리
+        if (event.pos() - self._drag_start_pos).manhattanLength() < 10:
+            return
+
+        # 선택된 박스가 있어야 드래그 가능
+        selected_boxes = self._get_selected_boxes()
+        if not selected_boxes:
+            return
+
+        self._dragging = True
+
+        # QDrag 생성
+        drag = QDrag(self)
+        mime_data = QMimeData()
+
+        # 박스 정보를 직렬화 (page_idx, box_id)
+        box_ids = []
+        for page_idx, box in selected_boxes:
+            if box.box_id:
+                box_ids.append(f"{page_idx}:{box.box_id}")
+
+        mime_data.setData("application/x-boxlist", ",".join(box_ids).encode('utf-8'))
+        drag.setMimeData(mime_data)
+
+        # 드래그 실행
+        drag.exec_(Qt.MoveAction)
+        self._dragging = False
+
+    def mouseReleaseEvent(self, event):
+        """마우스 릴리즈"""
+        self._drag_start_pos = None
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """더블클릭: 헤더면 접기/펼치기, 박스면 테마 선택 팝업"""
+        item = self.itemAt(event.pos())
+        if not item or not self._parent_window:
+            super().mouseDoubleClickEvent(event)
+            return
+
+        row = self.row(item)
+
+        if self._is_header_row(row):
+            # 테마 헤더 클릭 - 접기/펼치기
+            self._toggle_theme(item)
+        else:
+            # 박스 클릭 - 테마 선택 팝업
+            selected_rows = [self.row(i) for i in self.selectedItems()
+                           if not self._is_header_row(self.row(i))]
+            if selected_rows:
+                self._show_theme_popup(event.globalPos(), selected_rows)
+
+    def _toggle_theme(self, header_item):
+        """테마 접기/펼치기"""
+        if not self._parent_window:
+            return
+
+        header_text = header_item.text()
+        theme_id = None
+
+        if "(미지정)" in header_text:
+            theme_id = "__none__"
+        else:
+            for theme in self._parent_window.themes:
+                if theme.name in header_text:
+                    theme_id = theme.id
+                    break
+
+        if theme_id:
+            if theme_id in self._collapsed_themes:
+                self._collapsed_themes.remove(theme_id)
+            else:
+                self._collapsed_themes.add(theme_id)
+            self._parent_window._update_box_list()
+
+    def _show_theme_popup(self, global_pos, rows):
+        """테마 선택 팝업"""
+        if not self._parent_window:
+            return
+
+        menu = QMenu(self)
+
+        none_action = menu.addAction("(없음)")
+        none_action.setData(None)
+        menu.addSeparator()
+
+        for theme in self._parent_window.themes:
+            pixmap = QPixmap(12, 12)
+            pixmap.fill(QColor(theme.color))
+            action = menu.addAction(QIcon(pixmap), theme.name)
+            action.setData(theme.id)
+
+        action = menu.exec_(global_pos)
+        if action:
+            self.theme_selected.emit(rows, action.data())
+
+    def _show_context_menu(self, pos):
+        """우클릭 컨텍스트 메뉴"""
+        if not self._parent_window:
+            return
+
+        # 선택된 박스들
+        selected_boxes = self._get_selected_boxes()
+        if not selected_boxes:
+            return
+
+        menu = QMenu(self)
+
+        # 타입 변경 서브메뉴
+        type_menu = menu.addMenu("타입 변경")
+        question_action = type_menu.addAction("📝 문제")
+        question_action.setData(BOX_TYPE_QUESTION)
+        solution_action = type_menu.addAction("📖 해설")
+        solution_action.setData(BOX_TYPE_SOLUTION)
+
+        # 테마 변경 서브메뉴
+        theme_menu = menu.addMenu("테마 변경")
+        none_action = theme_menu.addAction("(없음)")
+        none_action.setData(("theme", None))
+        theme_menu.addSeparator()
+        for theme in self._parent_window.themes:
+            pixmap = QPixmap(12, 12)
+            pixmap.fill(QColor(theme.color))
+            action = theme_menu.addAction(QIcon(pixmap), theme.name)
+            action.setData(("theme", theme.id))
+
+        # 해설인 경우 문제 연결 메뉴 추가
+        # 선택된 박스가 하나이고 해설 타입인 경우
+        if len(selected_boxes) == 1:
+            page_idx, box = selected_boxes[0]
+            if box.box_type == BOX_TYPE_SOLUTION:
+                menu.addSeparator()
+                link_menu = menu.addMenu("문제 연결")
+
+                # 연결 해제 옵션
+                unlink_action = link_menu.addAction("(연결 해제)")
+                unlink_action.setData(("link", None))
+                link_menu.addSeparator()
+
+                # 문제 목록 (같은 테마 내의 문제들)
+                questions = self._parent_window.get_questions_for_linking(box)
+                for q_page_idx, q_box in questions:
+                    label = f"p{q_page_idx + 1}"
+                    if q_box.number:
+                        label += f" #{q_box.number}"
+                    # 현재 연결된 문제 표시
+                    if box.linked_box_id == q_box.box_id:
+                        label = "✓ " + label
+                    action = link_menu.addAction(label)
+                    action.setData(("link", q_box.box_id))
+
+        # 메뉴 실행
+        action = menu.exec_(self.mapToGlobal(pos))
+        if action:
+            data = action.data()
+            if data in (BOX_TYPE_QUESTION, BOX_TYPE_SOLUTION):
+                # 타입 변경
+                self.type_changed.emit(selected_boxes, data)
+            elif isinstance(data, tuple) and data[0] == "theme":
+                # 테마 변경
+                self.theme_changed.emit(selected_boxes, data[1])
+            elif isinstance(data, tuple) and data[0] == "link":
+                # 문제 연결
+                page_idx, box = selected_boxes[0]
+                box.linked_box_id = data[1]
+                self._parent_window._update_box_list()
+                self._parent_window.canvas.update()
+                self._parent_window._schedule_auto_save()
+                if data[1]:
+                    self._parent_window.status_label.setText("문제 연결됨")
+                else:
+                    self._parent_window.status_label.setText("문제 연결 해제됨")
+
+    def dragEnterEvent(self, event):
+        """드래그 진입"""
+        if event.mimeData().hasFormat("application/x-boxlist"):
+            self._highlighted_row = -1
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        """드래그 이동 - 테마 헤더 위에서만 허용, 하이라이트 표시"""
+        if not event.mimeData().hasFormat("application/x-boxlist"):
+            event.ignore()
+            return
+
+        # 이전 하이라이트 제거
+        if hasattr(self, '_highlighted_row') and self._highlighted_row >= 0:
+            old_item = self.item(self._highlighted_row)
+            if old_item and hasattr(self, '_original_bg'):
+                old_item.setBackground(self._original_bg)
+            self._highlighted_row = -1
+
+        item = self.itemAt(event.pos())
+        if item:
+            row = self.row(item)
+            # 테마 헤더 위에서만 드롭 허용
+            if self._is_header_row(row):
+                # 하이라이트 효과
+                self._original_bg = item.background()
+                self._highlighted_row = row
+                item.setBackground(QColor("#90EE90"))  # 연한 초록색
+                event.acceptProposedAction()
+                return
+
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        """드래그 영역 벗어남 - 하이라이트 제거"""
+        if hasattr(self, '_highlighted_row') and self._highlighted_row >= 0:
+            old_item = self.item(self._highlighted_row)
+            if old_item and hasattr(self, '_original_bg'):
+                old_item.setBackground(self._original_bg)
+            self._highlighted_row = -1
+        event.accept()
+
+    def dropEvent(self, event):
+        """드롭 - 테마 헤더에 박스 할당"""
+        # 하이라이트 제거
+        if hasattr(self, '_highlighted_row') and self._highlighted_row >= 0:
+            old_item = self.item(self._highlighted_row)
+            if old_item and hasattr(self, '_original_bg'):
+                old_item.setBackground(self._original_bg)
+            self._highlighted_row = -1
+
+        if not event.mimeData().hasFormat("application/x-boxlist"):
+            event.ignore()
+            return
+
+        if not self._parent_window:
+            event.ignore()
+            return
+
+        item = self.itemAt(event.pos())
+        if not item:
+            event.ignore()
+            return
+
+        row = self.row(item)
+        if not self._is_header_row(row):
+            event.ignore()
+            return
+
+        # 드롭 대상 테마 ID
+        target_theme_id = self._get_theme_id_from_header(item)
+
+        # 드래그된 박스들 파싱
+        data = event.mimeData().data("application/x-boxlist").data().decode('utf-8')
+        box_items = []
+
+        for item_str in data.split(","):
+            if ":" not in item_str:
+                continue
+            page_str, box_id = item_str.split(":", 1)
+            try:
+                page_idx = int(page_str)
+                box = self._parent_window.get_box_by_id(box_id)
+                if box:
+                    box_items.append((page_idx, box))
+            except ValueError:
+                continue
+
+        if box_items:
+            self.theme_changed.emit(box_items, target_theme_id)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+class ImageCanvas(QLabel):
+    """이미지 표시 및 박스 그리기 캔버스"""
+
+    DELETE_BTN_SIZE = 16  # 삭제 버튼 크기
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._parent_window = parent  # 약한 참조 대신 직접 참조
+        self.drawing = False
+        self.start_point = QPoint()
+        self.current_point = QPoint()
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+
+    @property
+    def parent_window(self):
+        """부모 윈도우 안전하게 접근"""
+        try:
+            if self._parent_window and not self._parent_window.isHidden():
+                return self._parent_window
+        except RuntimeError:
+            pass
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.pixmap():
+            # 먼저 삭제 버튼 클릭 확인
+            delete_btn_idx = self._get_delete_btn_at_pos(event.pos())
+            if delete_btn_idx is not None and self.parent_window:
+                self.parent_window.delete_box_on_canvas(delete_btn_idx)
+                return
+
+            # 클릭한 위치에 박스가 있는지 확인
+            clicked_box_idx = self._get_box_at_pos(event.pos())
+            if clicked_box_idx is not None:
+                # 박스 선택
+                if self.parent_window:
+                    self.parent_window.select_box_on_canvas(clicked_box_idx)
+            else:
+                # 새 박스 그리기 시작
+                self.drawing = True
+                self.start_point = event.pos()
+                self.current_point = event.pos()
+        elif event.button() == Qt.RightButton and self.pixmap():
+            # 오른쪽 클릭: 박스 삭제
+            clicked_box_idx = self._get_box_at_pos(event.pos())
+            if clicked_box_idx is not None and self.parent_window:
+                self.parent_window.delete_box_on_canvas(clicked_box_idx)
+
+    def _get_delete_btn_at_pos(self, pos):
+        """클릭 위치에 있는 삭제 버튼의 박스 인덱스 반환"""
+        if not self.parent_window:
+            return None
+
+        boxes = self.parent_window.get_current_boxes()
+        scale = self.parent_window.scale
+        btn_size = self.DELETE_BTN_SIZE
+
+        # 역순으로 검색 (위에 그려진 박스 우선)
+        for i in range(len(boxes) - 1, -1, -1):
+            box = boxes[i]
+            x2 = int(box.x2 * scale)
+            y1 = int(box.y1 * scale)
+
+            # 삭제 버튼 영역 (박스 오른쪽 상단)
+            btn_x = x2 - btn_size - 2
+            btn_y = y1 + 2
+
+            if btn_x <= pos.x() <= btn_x + btn_size and btn_y <= pos.y() <= btn_y + btn_size:
+                return i
+        return None
+
+    def _get_box_at_pos(self, pos):
+        """클릭 위치에 있는 박스 인덱스 반환"""
+        if not self.parent_window:
+            return None
+
+        boxes = self.parent_window.get_current_boxes()
+        scale = self.parent_window.scale
+
+        # 역순으로 검색 (위에 그려진 박스 우선)
+        for i in range(len(boxes) - 1, -1, -1):
+            box = boxes[i]
+            x1 = int(box.x1 * scale)
+            y1 = int(box.y1 * scale)
+            x2 = int(box.x2 * scale)
+            y2 = int(box.y2 * scale)
+
+            if x1 <= pos.x() <= x2 and y1 <= pos.y() <= y2:
+                return i
+        return None
+
+    def mouseMoveEvent(self, event):
+        if self.drawing:
+            self.current_point = event.pos()
+            self.update()
+        else:
+            # 삭제 버튼 위에서 커서 변경
+            if self._get_delete_btn_at_pos(event.pos()) is not None:
+                self.setCursor(Qt.PointingHandCursor)
+            else:
+                self.setCursor(Qt.CrossCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.drawing:
+            self.drawing = False
+            end_point = event.pos()
+
+            # 최소 크기 체크
+            if abs(end_point.x() - self.start_point.x()) > 20 and \
+               abs(end_point.y() - self.start_point.y()) > 20:
+                if self.parent_window:
+                    self.parent_window.add_box(self.start_point, end_point)
+
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        if not self.pixmap():
+            return
+
+        painter = QPainter(self)
+
+        try:
+            # 기존 박스 그리기
+            parent = self.parent_window
+            if parent:
+                boxes = parent.get_current_boxes()
+                selected_idx = parent.current_box_id
+                scale = parent.scale
+                current_page = parent.current_page_idx
+
+                # 현재 페이지의 박스별 순번 계산 (테마별)
+                box_labels = {}
+                theme_page_counts = {}
+                for page_idx, b in parent._sorted_boxes:
+                    if page_idx != current_page:
+                        continue
+                    theme_id = b.theme_id or "__none__"
+                    if theme_id not in theme_page_counts:
+                        theme_page_counts[theme_id] = 0
+                    theme_page_counts[theme_id] += 1
+                    box_labels[id(b)] = theme_page_counts[theme_id]
+
+                for i, box in enumerate(boxes):
+                    x1 = int(box.x1 * scale)
+                    y1 = int(box.y1 * scale)
+                    x2 = int(box.x2 * scale)
+                    y2 = int(box.y2 * scale)
+
+                    # 테마 색상 또는 기본 색상
+                    if i == selected_idx:
+                        color = QColor(255, 0, 0)  # 선택된 박스: 빨강
+                    elif box.theme_id:
+                        theme = parent.get_theme_by_id(box.theme_id)
+                        color = QColor(theme.color) if theme else QColor(0, 0, 255)
+                    else:
+                        color = QColor(0, 0, 255)  # 기본: 파랑
+
+                    # 유형에 따른 선 스타일: 문제=실선, 풀이=점선
+                    pen = QPen(color, 2)
+                    if box.box_type == BOX_TYPE_SOLUTION:
+                        pen.setStyle(Qt.DashLine)
+                    painter.setPen(pen)
+                    painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+
+                    # 레이블 (박스 목록과 동일한 형식: 01-01 #번호)
+                    box_num = box_labels.get(id(box), i + 1)
+                    type_icon = "📝" if box.box_type == BOX_TYPE_QUESTION else "📖"
+                    label = f"{type_icon} {current_page + 1:02d}-{box_num:02d}"
+                    if box.number:
+                        label += f" #{box.number}"
+                    if box.theme_id:
+                        theme = parent.get_theme_by_id(box.theme_id)
+                        if theme:
+                            label += f" {theme.name}"
+                    # 풀이 선 스타일 복원하고 텍스트 그리기
+                    pen.setStyle(Qt.SolidLine)
+                    painter.setPen(pen)
+                    painter.drawText(x1 + 5, y1 + 15, label)
+
+                    # 삭제 버튼 (박스 오른쪽 상단에 X 버튼)
+                    btn_size = self.DELETE_BTN_SIZE
+                    btn_x = x2 - btn_size - 2
+                    btn_y = y1 + 2
+
+                    # 버튼 배경 (빨간색 원)
+                    painter.setBrush(QColor(220, 53, 69))  # 빨간색
+                    painter.setPen(QPen(QColor(220, 53, 69), 1))
+                    painter.drawEllipse(btn_x, btn_y, btn_size, btn_size)
+
+                    # X 표시 (흰색)
+                    painter.setPen(QPen(QColor(255, 255, 255), 2))
+                    margin = 4
+                    painter.drawLine(btn_x + margin, btn_y + margin,
+                                     btn_x + btn_size - margin, btn_y + btn_size - margin)
+                    painter.drawLine(btn_x + btn_size - margin, btn_y + margin,
+                                     btn_x + margin, btn_y + btn_size - margin)
+
+                    # 브러시 초기화
+                    painter.setBrush(Qt.NoBrush)
+
+            # 드래그 중인 박스
+            if self.drawing:
+                pen = QPen(QColor(0, 255, 0), 2, Qt.DashLine)
+                painter.setPen(pen)
+                rect = QRect(self.start_point, self.current_point).normalized()
+                painter.drawRect(rect)
+        except Exception:
+            pass  # paintEvent에서 예외 발생 시 무시
+
+        painter.end()
+
+
+class PDFLabeler(QMainWindow):
+    """PDF 문항 레이블링 GUI 애플리케이션"""
+
+    MAX_RECENT_FILES = 10  # 최근 파일 최대 개수
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PDF 문항 레이블러")
+
+        # 설정 (최근 파일, 창 위치/크기 저장용)
+        self.settings = QSettings("PDFLabeler", "PDFLabeler")
+
+        # 저장된 창 위치/크기 복원
+        self._restore_window_geometry()
+
+        # 상태 변수
+        self.pdf_path: Optional[Path] = None
+        self.pages: List[Image.Image] = []
+        self.current_page_idx = 0
+        self.boxes: Dict[int, List[QuestionBox]] = {}
+        self.current_box_id: Optional[int] = None
+        self.scale = 1.0
+        self._box_index_map: List[tuple] = []  # (page_idx, box_idx) 매핑
+        self._sorted_boxes: List[tuple] = []  # 정렬된 (page_idx, box) 목록
+        self._auto_save_pending = False  # 자동 저장 대기 플래그
+        self.themes: List[Theme] = []  # 테마 목록
+        self._theme_counter = 0  # 테마 ID 생성용
+        self._box_counter = 0  # 박스 ID 생성용
+
+        # 자동 저장 타이머 (변경 후 2초 뒤 저장)
+        self._auto_save_timer = QTimer()
+        self._auto_save_timer.setSingleShot(True)
+        self._auto_save_timer.timeout.connect(self._do_auto_save)
+
+        self._setup_ui()
+        self._setup_menu()
+
+        # 최근 파일이 있으면 자동 로드, 없으면 환영 메시지
+        recent_files = self._get_recent_files()
+        if recent_files and Path(recent_files[0]).exists():
+            self._load_pdf(recent_files[0])
+        else:
+            self._show_welcome_message()
+
+    def _setup_menu(self):
+        """메뉴바 구성"""
+        menubar = self.menuBar()
+
+        # 파일 메뉴
+        file_menu = menubar.addMenu("파일")
+
+        open_action = QAction("PDF 열기", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self._open_pdf)
+        file_menu.addAction(open_action)
+
+        # 최근 항목 서브메뉴
+        self.recent_menu = file_menu.addMenu("최근 항목")
+        self._update_recent_menu()
+
+        file_menu.addSeparator()
+
+        export_action = QAction("이미지 내보내기", self)
+        export_action.setShortcut("Ctrl+E")
+        export_action.triggered.connect(self._export_images)
+        file_menu.addAction(export_action)
+
+        file_menu.addSeparator()
+
+        quit_action = QAction("종료", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+    def _update_recent_menu(self):
+        """최근 항목 메뉴 업데이트"""
+        self.recent_menu.clear()
+        recent = self._get_recent_files()
+
+        if not recent:
+            no_recent = QAction("(없음)", self)
+            no_recent.setEnabled(False)
+            self.recent_menu.addAction(no_recent)
+            return
+
+        for file_path in recent:
+            path = Path(file_path)
+            if path.exists():
+                action = QAction(path.name, self)
+                action.setToolTip(str(path))
+                action.triggered.connect(lambda checked, p=file_path: self._load_pdf(p))
+                self.recent_menu.addAction(action)
+
+        self.recent_menu.addSeparator()
+        clear_action = QAction("최근 항목 지우기", self)
+        clear_action.triggered.connect(self._clear_recent_files)
+        self.recent_menu.addAction(clear_action)
+
+    def _clear_recent_files(self):
+        """최근 파일 목록 지우기"""
+        self.settings.setValue("recent_files", [])
+        self._update_recent_menu()
+
+    def _restore_window_geometry(self):
+        """저장된 창 위치/크기 복원"""
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.setGeometry(100, 100, 1400, 900)
+
+    def _save_window_geometry(self):
+        """창 위치/크기 저장"""
+        self.settings.setValue("window_geometry", self.saveGeometry())
+
+    def closeEvent(self, event):
+        """창 닫힐 때 위치/크기 저장"""
+        self._save_window_geometry()
+        # 자동 저장 대기 중이면 즉시 저장
+        if self._auto_save_pending:
+            self._auto_save_timer.stop()
+            self._do_auto_save()
+        event.accept()
+
+    def _show_welcome_message(self):
+        """프로그램 소개 메시지 표시"""
+        welcome_text = """
+<div style="padding: 40px; font-family: sans-serif; max-width: 600px;">
+<h1 style="color: #333; text-align: center;">📄 PDF 문항 레이블러</h1>
+<p style="color: #666; font-size: 14px; text-align: center;">PDF 문서에서 문항을 박싱하고 레이블링하는 도구입니다.</p>
+
+<h3 style="color: #444; margin-top: 30px;">✨ 주요 기능</h3>
+<ul style="color: #555; line-height: 1.8;">
+<li><a href="action:open_pdf" style="color: #4a90d9; text-decoration: none;"><b>PDF 열기</b></a> - PDF 파일을 불러와 페이지별로 탐색</li>
+<li><b>박스 그리기</b> - 마우스 드래그로 문항 영역 선택</li>
+<li><b>레이블링</b> - 문항 번호와 테마/주제 입력</li>
+<li><b>순서 조정</b> - 박스 목록에서 순서 변경 가능</li>
+<li><b>자동 저장</b> - 작업 내용이 .works 폴더에 자동 저장</li>
+<li><b>이미지 내보내기</b> - 고해상도(300 DPI) 이미지 추출</li>
+</ul>
+
+<h3 style="color: #444; margin-top: 30px;">⌨️ 단축키</h3>
+<ul style="color: #555; line-height: 1.8;">
+<li><b>← / →</b> - 이전/다음 페이지</li>
+<li><b>Delete</b> - 선택된 박스 삭제</li>
+<li><b>+ / -</b> - 확대/축소</li>
+<li><b>스크롤</b> - 페이지 끝에서 추가 스크롤 시 페이지 이동</li>
+</ul>
+
+<p style="color: #888; margin-top: 40px; font-size: 12px; text-align: center;">
+👉 <a href="action:open_pdf" style="color: #4a90d9;"><b>PDF 열기</b></a>를 클릭하거나<br>
+우측 패널에서 최근 항목을 선택하세요.
+</p>
+
+<p style="color: #aaa; margin-top: 50px; font-size: 11px; text-align: center;">
+© 2026 MilliSquare
+</p>
+</div>
+"""
+        from PyQt5.QtWidgets import QTextBrowser, QFrame
+
+        # 컨테이너 위젯 생성 (수직 중앙 정렬용)
+        container = QWidget()
+        container.setStyleSheet("background-color: #f9f9f9;")
+        layout = QVBoxLayout(container)
+        layout.setAlignment(Qt.AlignCenter)
+
+        # 텍스트 브라우저
+        self.welcome_label = QTextBrowser()
+        self.welcome_label.setReadOnly(True)
+        self.welcome_label.setOpenLinks(False)  # 링크 자동 열기 비활성화
+        self.welcome_label.anchorClicked.connect(self._on_welcome_link_clicked)
+        self.welcome_label.setHtml(welcome_text)
+        self.welcome_label.setStyleSheet("background-color: #f9f9f9; border: none;")
+        self.welcome_label.setFixedSize(650, 550)
+        self.welcome_label.setFrameShape(QFrame.NoFrame)
+
+        layout.addWidget(self.welcome_label)
+        self.scroll_area.setWidget(container)
+
+    def _on_welcome_link_clicked(self, url):
+        """Welcome 메시지 링크 클릭 처리"""
+        if url.toString() == "action:open_pdf":
+            self._open_pdf()
+
+    def _get_works_dir(self) -> Optional[Path]:
+        """PDF 파일 위치의 .works 폴더 경로 반환"""
+        if not self.pdf_path:
+            return None
+        return self.pdf_path.parent / ".works"
+
+    def _get_auto_save_path(self) -> Optional[Path]:
+        """자동 저장 파일 경로 반환"""
+        works_dir = self._get_works_dir()
+        if not works_dir:
+            return None
+        return works_dir / f"{self.pdf_path.stem}.json"
+
+    def _get_backup_path(self) -> Optional[Path]:
+        """백업 파일 경로 반환"""
+        works_dir = self._get_works_dir()
+        if not works_dir:
+            return None
+        return works_dir / f"{self.pdf_path.stem}.backup.json"
+
+    def _schedule_auto_save(self):
+        """자동 저장 예약 (변경 후 2초 뒤 저장)"""
+        if not self.pdf_path:
+            return
+        self._auto_save_pending = True
+        self._auto_save_timer.start(2000)  # 2초 후 저장
+
+    def _do_auto_save(self):
+        """실제 자동 저장 수행 (두 벌 백업)"""
+        if not self.pdf_path or not self._auto_save_pending:
+            return
+
+        works_dir = self._get_works_dir()
+        if not works_dir:
+            return
+
+        # .works 폴더 생성
+        try:
+            works_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.status_label.setText(f"자동 저장 실패: {e}")
+            return
+
+        save_path = self._get_auto_save_path()
+        backup_path = self._get_backup_path()
+
+        # 저장할 데이터 준비
+        all_boxes = []
+        for page_idx, box in self._sorted_boxes:
+            box_dict = box.to_dict()
+            box_dict['_sort_order'] = self._sorted_boxes.index((page_idx, box))
+            all_boxes.append(box_dict)
+
+        # 테마 데이터 준비
+        themes_data = [theme.to_dict() for theme in self.themes]
+
+        data = {
+            "source_pdf": self.pdf_path.name,
+            "saved_at": datetime.now().isoformat(),
+            "themes": themes_data,
+            "total_boxes": len(all_boxes),
+            "boxes": all_boxes
+        }
+
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+
+        try:
+            # 1단계: 기존 파일이 있으면 백업으로 복사
+            if save_path.exists():
+                import shutil
+                shutil.copy2(save_path, backup_path)
+
+            # 2단계: 새 파일 저장
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+
+            self._auto_save_pending = False
+            self.status_label.setText(f"자동 저장됨 ({len(all_boxes)}개 박스)")
+
+        except Exception as e:
+            # 저장 실패 시 백업에서 복구 시도
+            self.status_label.setText(f"자동 저장 실패: {e}")
+            if backup_path and backup_path.exists():
+                try:
+                    import shutil
+                    shutil.copy2(backup_path, save_path)
+                except:
+                    pass
+
+    def _load_auto_saved_data(self):
+        """자동 저장된 데이터 로드"""
+        save_path = self._get_auto_save_path()
+        backup_path = self._get_backup_path()
+
+        # 메인 파일 시도
+        data = None
+        loaded_from = None
+
+        if save_path and save_path.exists():
+            try:
+                with open(save_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                loaded_from = save_path
+            except:
+                pass
+
+        # 메인 파일 실패 시 백업 시도
+        if data is None and backup_path and backup_path.exists():
+            try:
+                with open(backup_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                loaded_from = backup_path
+            except:
+                pass
+
+        if data is None:
+            return False
+
+        # 테마 로드
+        self.themes = []
+        self._theme_counter = 0
+        for theme_data in data.get("themes", []):
+            theme = Theme(
+                id=theme_data["id"],
+                name=theme_data["name"],
+                color=theme_data.get("color", "#3498db")
+            )
+            self.themes.append(theme)
+            # 테마 카운터 업데이트 (ID 충돌 방지)
+            if theme.id.startswith("theme_"):
+                try:
+                    num = int(theme.id.split("_")[1])
+                    self._theme_counter = max(self._theme_counter, num)
+                except ValueError:
+                    pass
+        self._update_theme_list()
+        self._update_theme_combo()
+
+        # 박스 데이터 로드
+        self.boxes = {i: [] for i in range(len(self.pages))}
+        self._sorted_boxes = []
+
+        # _sort_order로 정렬하여 로드
+        boxes_data = data.get("boxes", [])
+        boxes_data.sort(key=lambda x: x.get('_sort_order', 0))
+
+        for box_data in boxes_data:
+            page_idx = box_data.get("page", 1) - 1
+            if 0 <= page_idx < len(self.pages):
+                box = QuestionBox(
+                    x1=box_data["x1"],
+                    y1=box_data["y1"],
+                    x2=box_data["x2"],
+                    y2=box_data["y2"],
+                    number=box_data.get("number"),
+                    theme_id=box_data.get("theme_id"),
+                    page=box_data.get("page", 1),
+                    box_type=box_data.get("box_type", BOX_TYPE_QUESTION),
+                    linked_box_id=box_data.get("linked_box_id"),
+                    box_id=box_data.get("box_id")
+                )
+                # box_id가 없으면 생성
+                if not box.box_id:
+                    box.box_id = self._generate_box_id()
+                else:
+                    # box_counter 업데이트 (ID 충돌 방지)
+                    if box.box_id.startswith("box_"):
+                        try:
+                            num = int(box.box_id.split("_")[1])
+                            self._box_counter = max(self._box_counter, num)
+                        except ValueError:
+                            pass
+                self.boxes[page_idx].append(box)
+                self._sorted_boxes.append((page_idx, box))
+
+        # 썸네일에 박스 표시
+        self._update_thumbnail_boxes()
+
+        self.status_label.setText(f"자동 저장 데이터 로드됨 ({len(self._sorted_boxes)}개 박스, {len(self.themes)}개 테마)")
+        return True
+
+    def _setup_ui(self):
+        """UI 구성"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QHBoxLayout(central_widget)
+
+        # 스플리터
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # 좌측: 썸네일 패널 (토글 버튼 포함)
+        self.thumbnail_panel = QWidget()
+        self.thumbnail_panel.setMaximumWidth(120)
+        self.thumbnail_panel.setMinimumWidth(100)
+        thumbnail_layout = QVBoxLayout(self.thumbnail_panel)
+        thumbnail_layout.setContentsMargins(2, 2, 2, 2)
+
+        # 사이드바 토글 버튼
+        self.sidebar_toggle_btn = QPushButton("◀")
+        self.sidebar_toggle_btn.setFixedHeight(24)
+        self.sidebar_toggle_btn.setToolTip("사이드바 숨기기")
+        self.sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
+        thumbnail_layout.addWidget(self.sidebar_toggle_btn)
+
+        thumbnail_label = QLabel("페이지")
+        thumbnail_label.setAlignment(Qt.AlignCenter)
+        thumbnail_layout.addWidget(thumbnail_label)
+
+        self.thumbnail_scroll = QScrollArea()
+        self.thumbnail_scroll.setWidgetResizable(True)
+        self.thumbnail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self.thumbnail_container = QWidget()
+        self.thumbnail_list_layout = QVBoxLayout(self.thumbnail_container)
+        self.thumbnail_list_layout.setSpacing(5)
+        self.thumbnail_list_layout.setAlignment(Qt.AlignTop)
+        self.thumbnail_scroll.setWidget(self.thumbnail_container)
+
+        thumbnail_layout.addWidget(self.thumbnail_scroll)
+        splitter.addWidget(self.thumbnail_panel)
+
+        # 처음에는 썸네일 패널 숨기기
+        self.thumbnail_panel.hide()
+        self._sidebar_visible = True  # 사이드바 표시 상태
+
+        # 사이드바 보이기 버튼 (숨겨졌을 때 표시)
+        self.sidebar_show_btn = QPushButton("▶")
+        self.sidebar_show_btn.setFixedWidth(20)
+        self.sidebar_show_btn.setToolTip("사이드바 보이기")
+        self.sidebar_show_btn.clicked.connect(self._toggle_sidebar)
+        self.sidebar_show_btn.hide()
+        main_layout.insertWidget(0, self.sidebar_show_btn)
+
+        # 중앙: 이미지 캔버스
+        self.scroll_area = ScrollAreaWithPageNav()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.page_next.connect(lambda: self._next_page(scroll_to_top=True))
+        self.scroll_area.page_prev.connect(lambda: self._prev_page(scroll_to_bottom=True))
+        self.canvas = ImageCanvas(self)
+        self.canvas.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.scroll_area.setWidget(self.canvas)
+        splitter.addWidget(self.scroll_area)
+
+        # 우측: 컨트롤 패널
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(300)
+        control_layout = QVBoxLayout(control_panel)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 상단 영역 (테마 위)
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        top_layout.setContentsMargins(5, 5, 5, 5)
+
+        # 교재 이름 표시
+        self.textbook_label = QLabel("교재: (없음)")
+        self.textbook_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
+        self.textbook_label.setWordWrap(True)
+        top_layout.addWidget(self.textbook_label)
+
+        # 상단 툴바 (확대/축소)
+        toolbar_layout = QHBoxLayout()
+
+        btn_zoom_out = QPushButton("−")
+        btn_zoom_out.setFixedSize(30, 30)
+        btn_zoom_out.setToolTip("축소")
+        btn_zoom_out.clicked.connect(self._zoom_out)
+        toolbar_layout.addWidget(btn_zoom_out)
+
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(50)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        toolbar_layout.addWidget(self.zoom_label)
+
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setFixedSize(30, 30)
+        btn_zoom_in.setToolTip("확대")
+        btn_zoom_in.clicked.connect(self._zoom_in)
+        toolbar_layout.addWidget(btn_zoom_in)
+
+        btn_fit = QPushButton("맞춤")
+        btn_fit.setFixedSize(50, 30)
+        btn_fit.setToolTip("화면 폭에 맞춤")
+        btn_fit.clicked.connect(self._fit_to_window)
+        toolbar_layout.addWidget(btn_fit)
+
+        toolbar_layout.addStretch()
+        top_layout.addLayout(toolbar_layout)
+
+        # 페이지 정보 (읽기 전용)
+        self.page_label = QLabel("페이지: 0 / 0")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        top_layout.addWidget(self.page_label)
+
+        # 테마 관리
+        theme_group = QGroupBox("테마 (더블클릭으로 박스에 할당)")
+        theme_layout = QVBoxLayout(theme_group)
+
+        self.theme_list = ThemeListWidget()
+        self.theme_list.setMaximumHeight(120)
+        self.theme_list.itemClicked.connect(self._on_theme_select)
+        self.theme_list.itemDoubleClicked.connect(self._on_theme_double_click)
+        self.theme_list.itemChanged.connect(self._on_theme_item_changed)
+        self.theme_list.box_dropped.connect(self._on_box_dropped_to_theme)
+        self.theme_list.viewport().installEventFilter(self)  # 빈 영역 더블클릭 감지
+        theme_layout.addWidget(self.theme_list)
+
+        theme_btn_layout = QHBoxLayout()
+        btn_add_theme = QPushButton("+")
+        btn_add_theme.setFixedWidth(30)
+        btn_add_theme.setToolTip("테마 추가")
+        btn_add_theme.clicked.connect(self._add_theme)
+        theme_btn_layout.addWidget(btn_add_theme)
+
+        btn_edit_theme = QPushButton("✎")
+        btn_edit_theme.setFixedWidth(30)
+        btn_edit_theme.setToolTip("테마 편집")
+        btn_edit_theme.clicked.connect(self._edit_theme)
+        theme_btn_layout.addWidget(btn_edit_theme)
+
+        btn_delete_theme = QPushButton("−")
+        btn_delete_theme.setFixedWidth(30)
+        btn_delete_theme.setToolTip("테마 삭제")
+        btn_delete_theme.clicked.connect(self._delete_theme)
+        theme_btn_layout.addWidget(btn_delete_theme)
+
+        theme_btn_layout.addStretch()
+        theme_layout.addLayout(theme_btn_layout)
+
+        top_layout.addWidget(theme_group)
+
+        # 상태 표시
+        self.status_label = QLabel("PDF를 열어주세요")
+        top_layout.addWidget(self.status_label)
+
+        # 더미 콤보박스들 (내부 로직용 - 숨김)
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("📝 문제", BOX_TYPE_QUESTION)
+        self.type_combo.addItem("📖 풀이", BOX_TYPE_SOLUTION)
+        self.type_combo.hide()
+
+        self.number_input = QLineEdit()
+        self.number_input.hide()
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("(없음)", None)
+        self.theme_combo.hide()
+
+        self.link_label = QLabel()
+        self.link_label.hide()
+        self.link_combo = QComboBox()
+        self.link_combo.hide()
+
+        # 전체 박스 목록 (테마 아래)
+        box_list_widget = QWidget()
+        box_list_layout = QVBoxLayout(box_list_widget)
+        box_list_layout.setContentsMargins(5, 5, 5, 5)
+
+        box_list_label = QLabel("전체 박스 목록")
+        box_list_label.setStyleSheet("font-weight: bold; padding: 3px;")
+        box_list_layout.addWidget(box_list_label)
+
+        self.box_list = BoxListWidget()
+        self.box_list.set_parent_window(self)
+        self.box_list.itemClicked.connect(self._on_box_select)
+        self.box_list.theme_selected.connect(self._on_theme_selected_from_popup)
+        self.box_list.theme_changed.connect(self._on_theme_changed_by_drag)
+        self.box_list.type_changed.connect(self._on_type_changed_by_context)
+        box_list_layout.addWidget(self.box_list)
+
+        # 수직 splitter로 테마 영역과 박스 목록 분리
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.addWidget(top_widget)
+        right_splitter.addWidget(box_list_widget)
+        # 50:50 비율 설정
+        right_splitter.setSizes([300, 300])
+
+        control_layout.addWidget(right_splitter)
+
+        splitter.addWidget(control_panel)
+        splitter.setSizes([100, 800, 300])
+
+    def _toggle_sidebar(self):
+        """사이드바 토글"""
+        if self._sidebar_visible:
+            # 숨기기
+            self.thumbnail_panel.hide()
+            self.sidebar_show_btn.show()
+            self._sidebar_visible = False
+        else:
+            # 보이기
+            if self.pdf_path:  # PDF가 열려있을 때만
+                self.thumbnail_panel.show()
+            self.sidebar_show_btn.hide()
+            self._sidebar_visible = True
+
+    def keyPressEvent(self, event):
+        """키보드 이벤트"""
+        if event.key() == Qt.Key_Left:
+            self._prev_page()
+        elif event.key() == Qt.Key_Right:
+            self._next_page()
+        elif event.key() == Qt.Key_Delete:
+            self._delete_selected_box()
+        elif event.key() == Qt.Key_Plus:
+            self._zoom_in()
+        elif event.key() == Qt.Key_Minus:
+            self._zoom_out()
+
+    def eventFilter(self, obj, event):
+        """이벤트 필터 - 테마 목록 빈 영역 더블클릭 감지"""
+        from PyQt5.QtCore import QEvent
+        if obj == self.theme_list.viewport() and event.type() == QEvent.MouseButtonDblClick:
+            item = self.theme_list.itemAt(event.pos())
+            if item is None:
+                # 빈 영역 더블클릭 → 새 항목 추가 후 인라인 편집
+                new_item = QListWidgetItem("")
+                new_item.setFlags(new_item.flags() | Qt.ItemIsEditable)
+                new_item.setData(Qt.UserRole, None)  # 아직 ID 없음
+                self.theme_list.addItem(new_item)
+                self.theme_list.setCurrentItem(new_item)
+                self.theme_list.editItem(new_item)
+                return True
+            # 항목 위 더블클릭은 itemDoubleClicked 시그널에서 처리
+            return False
+        return super().eventFilter(obj, event)
+
+    # ===== 테마 관리 =====
+    def get_theme_by_id(self, theme_id: str) -> Optional[Theme]:
+        """ID로 테마 찾기"""
+        for theme in self.themes:
+            if theme.id == theme_id:
+                return theme
+        return None
+
+    def _generate_theme_id(self) -> str:
+        """새 테마 ID 생성"""
+        self._theme_counter += 1
+        return f"theme_{self._theme_counter}"
+
+    def _update_theme_list(self):
+        """테마 목록 UI 업데이트"""
+        self.theme_list.blockSignals(True)  # 시그널 임시 차단
+        self.theme_list.clear()
+        for theme in self.themes:
+            item = QListWidgetItem(theme.name)
+            item.setForeground(QColor(theme.color))
+            item.setData(Qt.UserRole, theme.id)
+            item.setFlags(item.flags() | Qt.ItemIsEditable)  # 편집 가능
+            self.theme_list.addItem(item)
+        self.theme_list.blockSignals(False)
+
+    def _update_theme_combo(self):
+        """테마 콤보박스 업데이트"""
+        self.theme_combo.clear()
+        self.theme_combo.addItem("(없음)", None)
+        for theme in self.themes:
+            self.theme_combo.addItem(f"● {theme.name}", theme.id)
+
+    def _add_theme(self):
+        """테마 추가 - 인라인 편집으로 시작"""
+        new_item = QListWidgetItem("")
+        new_item.setFlags(new_item.flags() | Qt.ItemIsEditable)
+        new_item.setData(Qt.UserRole, None)  # 아직 ID 없음
+        self.theme_list.addItem(new_item)
+        self.theme_list.setCurrentItem(new_item)
+        self.theme_list.editItem(new_item)
+
+    def _edit_theme(self):
+        """선택된 테마 편집 - 인라인 편집 시작"""
+        current = self.theme_list.currentItem()
+        if current:
+            self.theme_list.editItem(current)
+
+    def _delete_theme(self):
+        """선택된 테마 삭제"""
+        current = self.theme_list.currentItem()
+        if not current:
+            return
+
+        theme_id = current.data(Qt.UserRole)
+        theme = self.get_theme_by_id(theme_id)
+        if not theme:
+            return
+
+        # 이 테마를 사용하는 박스가 있는지 확인
+        using_count = sum(1 for _, box in self._sorted_boxes if box.theme_id == theme_id)
+        if using_count > 0:
+            reply = QMessageBox.question(
+                self, "테마 삭제",
+                f"이 테마를 사용하는 {using_count}개의 문항이 있습니다.\n삭제하면 연결이 해제됩니다. 계속하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            # 연결 해제
+            for _, box in self._sorted_boxes:
+                if box.theme_id == theme_id:
+                    box.theme_id = None
+
+        self.themes.remove(theme)
+        self._update_theme_list()
+        self._update_theme_combo()
+        self._update_box_list()
+        self.canvas.update()
+        self._schedule_auto_save()
+
+    def _on_theme_select(self, item):
+        """테마 목록에서 선택"""
+        theme_id = item.data(Qt.UserRole)
+        # 콤보박스에서 해당 테마 선택
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == theme_id:
+                self.theme_combo.setCurrentIndex(i)
+                break
+
+    def _on_theme_double_click(self, item):
+        """테마 목록 더블클릭 - 인라인 편집 시작"""
+        if item:
+            self.theme_list.editItem(item)
+
+    def _on_theme_item_changed(self, item):
+        """테마 항목 편집 완료"""
+        if not item:
+            return
+        theme_id = item.data(Qt.UserRole)
+        new_name = item.text().strip()
+
+        if theme_id:
+            # 기존 테마 이름 수정
+            theme = self.get_theme_by_id(theme_id)
+            if theme and new_name:
+                theme.name = new_name
+                self._update_theme_combo()
+                self._update_box_list()
+                self.canvas.update()
+                self._schedule_auto_save()
+            elif not new_name:
+                # 빈 이름이면 원래 이름으로 복원
+                self._update_theme_list()
+        else:
+            # 새 테마 추가 완료
+            if new_name:
+                theme = Theme(
+                    id=self._generate_theme_id(),
+                    name=new_name,
+                    color="#3498db"
+                )
+                self.themes.append(theme)
+                self._update_theme_list()
+                self._update_theme_combo()
+                self._schedule_auto_save()
+            else:
+                # 빈 이름이면 항목 제거
+                self._update_theme_list()
+
+    def _on_box_dropped_to_theme(self, theme_id: str):
+        """박스가 테마에 드롭됨"""
+        # 현재 선택된 박스의 인덱스 가져오기
+        list_idx = self.box_list.currentRow()
+        if list_idx < 0 or list_idx >= len(self._box_index_map):
+            return
+
+        map_entry = self._box_index_map[list_idx]
+        if map_entry is None:  # 헤더는 무시
+            return
+
+        page_idx, box = map_entry
+
+        # 테마 할당
+        old_theme_id = box.theme_id
+        box.theme_id = theme_id
+
+        # UI 업데이트
+        self._update_box_list()
+        if old_theme_id != theme_id:
+            self._update_thumbnail_boxes(page_idx)
+        self.canvas.update()
+        self._schedule_auto_save()
+
+        # 테마 콤보박스도 업데이트 (선택된 박스의 테마 반영)
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == theme_id:
+                self.theme_combo.setCurrentIndex(i)
+                break
+
+        self.status_label.setText(f"박스가 테마에 할당됨")
+
+    def _on_theme_selected_from_popup(self, list_rows: list, theme_id):
+        """팝업 메뉴에서 테마 선택됨 (멀티 선택 지원)"""
+        if not list_rows:
+            return
+
+        updated_pages = set()
+        count = 0
+
+        for list_row in list_rows:
+            if list_row < 0 or list_row >= len(self._box_index_map):
+                continue
+
+            map_entry = self._box_index_map[list_row]
+            if map_entry is None:  # 헤더는 무시
+                continue
+
+            page_idx, box = map_entry
+
+            # 테마 할당
+            if box.theme_id != theme_id:
+                box.theme_id = theme_id
+                updated_pages.add(page_idx)
+                count += 1
+
+        if count > 0:
+            # UI 업데이트
+            self._update_box_list()
+            for page_idx in updated_pages:
+                self._update_thumbnail_boxes(page_idx)
+            self.canvas.update()
+            self._schedule_auto_save()
+
+            # 테마 이름 가져오기
+            if theme_id:
+                theme = self.get_theme_by_id(theme_id)
+                theme_name = theme.name if theme else "알 수 없음"
+            else:
+                theme_name = "(없음)"
+            self.status_label.setText(f"{count}개 박스 테마 변경: {theme_name}")
+
+    def _on_theme_changed_by_drag(self, box_items: list, theme_id):
+        """드래그앤드롭으로 테마 변경"""
+        if not box_items:
+            return
+
+        updated_pages = set()
+        count = 0
+
+        for page_idx, box in box_items:
+            if box.theme_id != theme_id:
+                box.theme_id = theme_id
+                updated_pages.add(page_idx)
+                count += 1
+
+        if count > 0:
+            self._update_box_list()
+            for page_idx in updated_pages:
+                self._update_thumbnail_boxes(page_idx)
+            self.canvas.update()
+            self._schedule_auto_save()
+
+            if theme_id:
+                theme = self.get_theme_by_id(theme_id)
+                theme_name = theme.name if theme else "알 수 없음"
+            else:
+                theme_name = "(없음)"
+            self.status_label.setText(f"{count}개 박스 테마 변경: {theme_name}")
+
+    def _on_type_changed_by_context(self, box_items: list, box_type: str):
+        """우클릭 메뉴로 박스 타입 변경"""
+        if not box_items:
+            return
+
+        updated_pages = set()
+        count = 0
+
+        for page_idx, box in box_items:
+            if box.box_type != box_type:
+                box.box_type = box_type
+                # 문제로 변경시 연결 해제
+                if box_type == BOX_TYPE_QUESTION:
+                    box.linked_box_id = None
+                updated_pages.add(page_idx)
+                count += 1
+
+        if count > 0:
+            self._update_box_list()
+            for page_idx in updated_pages:
+                self._update_thumbnail_boxes(page_idx)
+            self.canvas.update()
+            self._schedule_auto_save()
+
+            type_name = "문제" if box_type == BOX_TYPE_QUESTION else "해설"
+            self.status_label.setText(f"{count}개 박스 타입 변경: {type_name}")
+
+    # ===== 박스 유형 및 연결 관리 =====
+    def _generate_box_id(self) -> str:
+        """새 박스 ID 생성"""
+        self._box_counter += 1
+        return f"box_{self._box_counter}"
+
+    def get_box_by_id(self, box_id: str) -> Optional[QuestionBox]:
+        """ID로 박스 찾기"""
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                if box.box_id == box_id:
+                    return box
+        return None
+
+    def get_questions_for_linking(self, solution_box: QuestionBox) -> list:
+        """해설과 연결할 수 있는 문제 목록 반환"""
+        result = []
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                # 문제 타입만, 같은 테마
+                if box.box_type == BOX_TYPE_QUESTION and box.theme_id == solution_box.theme_id:
+                    result.append((page_idx, box))
+        # 페이지, 번호 순 정렬
+        result.sort(key=lambda x: (x[0], x[1].number or 0))
+        return result
+
+    def _on_type_changed(self, index):
+        """유형 콤보박스 변경 시"""
+        box_type = self.type_combo.currentData()
+        if box_type == BOX_TYPE_SOLUTION:
+            # 풀이 선택 시 연결 콤보박스 표시
+            self.link_label.show()
+            self.link_combo.show()
+            self._update_link_combo()
+        else:
+            # 문제 선택 시 연결 콤보박스 숨김
+            self.link_label.hide()
+            self.link_combo.hide()
+
+    def _update_link_combo(self):
+        """문제 연결 콤보박스 업데이트 (문제 유형만 표시)"""
+        self.link_combo.clear()
+        self.link_combo.addItem("(없음)", None)
+
+        for page_idx, box in self._sorted_boxes:
+            if box.box_type == BOX_TYPE_QUESTION:
+                # 문제만 표시
+                label = f"{page_idx + 1:02d}p"
+                if box.number:
+                    label += f" #{box.number}"
+                if box.theme_id:
+                    theme = self.get_theme_by_id(box.theme_id)
+                    if theme:
+                        label += f" [{theme.name}]"
+                self.link_combo.addItem(label, box.box_id)
+
+    def _get_linked_solutions(self, question_box_id: str) -> List[QuestionBox]:
+        """특정 문제에 연결된 풀이들 반환"""
+        solutions = []
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                if box.linked_box_id == question_box_id:
+                    solutions.append(box)
+        return solutions
+
+    def _get_recent_files(self) -> List[str]:
+        """최근 파일 목록 가져오기"""
+        recent = self.settings.value("recent_files", [])
+        if isinstance(recent, str):
+            recent = [recent] if recent else []
+        return recent or []
+
+    def _add_to_recent_files(self, file_path: str):
+        """최근 파일 목록에 추가"""
+        recent = self._get_recent_files()
+
+        # 이미 있으면 제거 (맨 앞으로 이동시키기 위해)
+        if file_path in recent:
+            recent.remove(file_path)
+
+        # 맨 앞에 추가
+        recent.insert(0, file_path)
+
+        # 최대 개수 유지
+        recent = recent[:self.MAX_RECENT_FILES]
+
+        self.settings.setValue("recent_files", recent)
+        self._update_recent_menu()
+
+    def get_current_boxes(self) -> List[QuestionBox]:
+        """현재 페이지의 박스 목록"""
+        return self.boxes.get(self.current_page_idx, [])
+
+    def select_box_on_canvas(self, box_idx: int):
+        """캔버스에서 박스 선택"""
+        boxes = self.get_current_boxes()
+        if 0 <= box_idx < len(boxes):
+            self.current_box_id = box_idx
+            box = boxes[box_idx]
+
+            # 레이블 입력 필드 업데이트
+            self.number_input.setText(str(box.number) if box.number else "")
+
+            # 테마 콤보박스 업데이트
+            idx = 0
+            for i in range(self.theme_combo.count()):
+                if self.theme_combo.itemData(i) == box.theme_id:
+                    idx = i
+                    break
+            self.theme_combo.setCurrentIndex(idx)
+
+            # 유형 콤보박스 업데이트
+            type_idx = 0
+            for i in range(self.type_combo.count()):
+                if self.type_combo.itemData(i) == box.box_type:
+                    type_idx = i
+                    break
+            self.type_combo.setCurrentIndex(type_idx)
+
+            # 연결 콤보박스 업데이트 (풀이인 경우)
+            if box.box_type == BOX_TYPE_SOLUTION:
+                self.link_label.show()
+                self.link_combo.show()
+                self._update_link_combo()
+                # 현재 연결된 문제 선택
+                link_idx = 0
+                for i in range(self.link_combo.count()):
+                    if self.link_combo.itemData(i) == box.linked_box_id:
+                        link_idx = i
+                        break
+                self.link_combo.setCurrentIndex(link_idx)
+            else:
+                self.link_label.hide()
+                self.link_combo.hide()
+
+            # 전체 목록에서 해당 박스 선택
+            for list_idx, entry in enumerate(self._box_index_map):
+                if entry is None:  # 헤더는 건너뛰기
+                    continue
+                page_idx_entry, b = entry
+                if page_idx_entry == self.current_page_idx and b is box:
+                    self.box_list.setCurrentRow(list_idx)
+                    break
+
+            self.canvas.update()
+
+    def delete_box_on_canvas(self, box_idx: int):
+        """캔버스에서 박스 삭제 (오른쪽 클릭)"""
+        boxes = self.get_current_boxes()
+        if 0 <= box_idx < len(boxes):
+            box = boxes[box_idx]
+
+            # boxes 딕셔너리에서 삭제
+            self.boxes[self.current_page_idx].remove(box)
+
+            # 정렬 목록에서도 삭제
+            if (self.current_page_idx, box) in self._sorted_boxes:
+                self._sorted_boxes.remove((self.current_page_idx, box))
+
+            self.current_box_id = None
+            self._update_box_list()
+            self._update_thumbnail_boxes(self.current_page_idx)  # 썸네일 업데이트
+            self.canvas.update()
+            self._schedule_auto_save()
+
+    def add_box(self, start: QPoint, end: QPoint):
+        """박스 추가"""
+        x1 = int(min(start.x(), end.x()) / self.scale)
+        y1 = int(min(start.y(), end.y()) / self.scale)
+        x2 = int(max(start.x(), end.x()) / self.scale)
+        y2 = int(max(start.y(), end.y()) / self.scale)
+
+        box = QuestionBox(
+            x1=x1, y1=y1, x2=x2, y2=y2,
+            page=self.current_page_idx + 1,
+            box_id=self._generate_box_id()
+        )
+
+        if self.current_page_idx not in self.boxes:
+            self.boxes[self.current_page_idx] = []
+
+        self.boxes[self.current_page_idx].append(box)
+        self.current_box_id = len(self.boxes[self.current_page_idx]) - 1
+
+        # 정렬 목록에 추가하고 재정렬
+        self._sorted_boxes.append((self.current_page_idx, box))
+        self._sorted_boxes.sort(key=lambda x: self._get_box_sort_key(x[0], x[1]))
+
+        self._update_box_list()
+        self._update_thumbnail_boxes(self.current_page_idx)  # 썸네일 업데이트
+        self._schedule_auto_save()  # 자동 저장
+
+        # 전체 목록에서 방금 추가한 박스의 인덱스 찾기
+        for list_idx, entry in enumerate(self._box_index_map):
+            if entry is None:  # 헤더는 건너뛰기
+                continue
+            page_idx, b = entry
+            if page_idx == self.current_page_idx and b is box:
+                self.box_list.setCurrentRow(list_idx)
+                break
+
+        self.canvas.update()
+
+    def _open_pdf(self):
+        """PDF 파일 열기 다이얼로그"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "PDF 파일 선택", "", "PDF files (*.pdf);;All files (*.*)"
+        )
+        if file_path:
+            self._load_pdf(file_path)
+
+    def _load_pdf(self, file_path: str):
+        """PDF 파일 로드"""
+        self.pdf_path = Path(file_path)
+        self.status_label.setText("PDF 로딩 중...")
+        QApplication.processEvents()
+
+        try:
+            self.pages = convert_from_path(str(self.pdf_path), dpi=150)
+            self.current_page_idx = 0
+            self.boxes = {i: [] for i in range(len(self.pages))}
+            self._sorted_boxes = []  # 정렬 목록 초기화
+
+            # 캔버스를 새로 생성하고 스크롤 영역에 설정 (welcome 메시지 대체)
+            self.canvas = ImageCanvas(self)
+            self.canvas.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            self.scroll_area.setWidget(self.canvas)
+
+            # 썸네일 패널 표시 (사이드바 상태에 따라)
+            if self._sidebar_visible:
+                self.thumbnail_panel.show()
+                self.sidebar_show_btn.hide()
+            else:
+                self.sidebar_show_btn.show()
+
+            # 썸네일 생성
+            self._create_thumbnails()
+
+            # 교재 이름 표시
+            self.textbook_label.setText(f"📚 {self.pdf_path.stem}")
+
+            # 자동 저장된 데이터가 있으면 로드
+            if self._load_auto_saved_data():
+                pass  # 이미 status_label 업데이트됨
+            else:
+                self.status_label.setText(f"로드 완료: {self.pdf_path.name}")
+
+            # 기본 보기: 화면 폭에 맞춤
+            self._fit_to_window()
+
+            # 최근 파일에 추가
+            self._add_to_recent_files(str(self.pdf_path.resolve()))
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"PDF 로드 실패: {e}")
+            self.status_label.setText("PDF 로드 실패")
+
+    def _create_thumbnails(self):
+        """페이지 썸네일 생성"""
+        # 기존 썸네일 제거
+        while self.thumbnail_list_layout.count():
+            item = self.thumbnail_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self.thumbnail_buttons = []
+        self.thumbnail_base_pixmaps = []  # 원본 썸네일 저장
+
+        for idx, page in enumerate(self.pages):
+            # 썸네일 크기 (폭 80px 기준)
+            thumb_width = 80
+            aspect_ratio = page.height / page.width
+            thumb_height = int(thumb_width * aspect_ratio)
+
+            # PIL -> QPixmap
+            thumb_img = page.resize((thumb_width, thumb_height), Image.Resampling.LANCZOS)
+            data = thumb_img.convert("RGB").tobytes("raw", "RGB")
+            qimage = QImage(data, thumb_img.width, thumb_img.height, thumb_img.width * 3, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimage)
+
+            self.thumbnail_base_pixmaps.append((pixmap, page.width, page.height))
+
+            # 버튼으로 썸네일 생성
+            btn = QPushButton()
+            btn.setIcon(QIcon(pixmap))
+            btn.setIconSize(pixmap.size())
+            btn.setFixedSize(thumb_width + 10, thumb_height + 20)
+            btn.setToolTip(f"페이지 {idx + 1}")
+            btn.setStyleSheet("QPushButton { text-align: center; padding: 2px; }")
+            btn.setText(f"{idx + 1}")
+
+            # 클릭 시 해당 페이지로 이동
+            btn.clicked.connect(lambda checked, i=idx: self._go_to_page(i))
+
+            self.thumbnail_list_layout.addWidget(btn)
+            self.thumbnail_buttons.append(btn)
+
+        # 현재 페이지 강조
+        self._update_thumbnail_highlight()
+
+    def _update_thumbnail_boxes(self, page_idx: Optional[int] = None):
+        """썸네일에 박스 표시 업데이트"""
+        if not hasattr(self, 'thumbnail_buttons') or not hasattr(self, 'thumbnail_base_pixmaps'):
+            return
+
+        # 특정 페이지만 또는 전체 업데이트
+        if page_idx is not None:
+            indices = [page_idx]
+        else:
+            indices = range(len(self.thumbnail_buttons))
+
+        for idx in indices:
+            if idx >= len(self.thumbnail_buttons) or idx >= len(self.thumbnail_base_pixmaps):
+                continue
+
+            base_pixmap, orig_width, orig_height = self.thumbnail_base_pixmaps[idx]
+            boxes = self.boxes.get(idx, [])
+
+            # 박스가 없으면 원본 사용
+            if not boxes:
+                self.thumbnail_buttons[idx].setIcon(QIcon(base_pixmap))
+                continue
+
+            # 박스가 있으면 복사본에 그리기
+            pixmap = base_pixmap.copy()
+            painter = QPainter(pixmap)
+
+            # 스케일 계산
+            scale_x = pixmap.width() / orig_width
+            scale_y = pixmap.height() / orig_height
+
+            for box in boxes:
+                # 테마 색상
+                if box.theme_id:
+                    theme = self.get_theme_by_id(box.theme_id)
+                    color = QColor(theme.color) if theme else QColor(0, 0, 255)
+                else:
+                    color = QColor(0, 0, 255)
+
+                pen = QPen(color, 1)
+                painter.setPen(pen)
+
+                x1 = int(box.x1 * scale_x)
+                y1 = int(box.y1 * scale_y)
+                x2 = int(box.x2 * scale_x)
+                y2 = int(box.y2 * scale_y)
+                painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+
+            painter.end()
+            self.thumbnail_buttons[idx].setIcon(QIcon(pixmap))
+
+    def _update_thumbnail_highlight(self):
+        """현재 페이지 썸네일 강조 및 스크롤"""
+        if not hasattr(self, 'thumbnail_buttons'):
+            return
+
+        for idx, btn in enumerate(self.thumbnail_buttons):
+            if idx == self.current_page_idx:
+                btn.setStyleSheet("QPushButton { background-color: #4a90d9; color: white; font-weight: bold; }")
+                # 현재 페이지 썸네일이 보이도록 스크롤
+                self.thumbnail_scroll.ensureWidgetVisible(btn)
+            else:
+                btn.setStyleSheet("QPushButton { background-color: none; }")
+
+    def _go_to_page(self, page_idx: int):
+        """특정 페이지로 이동"""
+        if 0 <= page_idx < len(self.pages):
+            self.current_page_idx = page_idx
+            self.current_box_id = None
+            self._display_page()
+            self._update_thumbnail_highlight()
+
+    def _display_page(self):
+        """현재 페이지 표시"""
+        if not self.pages:
+            return
+
+        page = self.pages[self.current_page_idx]
+
+        # PIL -> QPixmap 변환
+        new_width = int(page.width * self.scale)
+        new_height = int(page.height * self.scale)
+        resized = page.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # PIL Image -> QImage -> QPixmap
+        data = resized.convert("RGB").tobytes("raw", "RGB")
+        qimage = QImage(data, resized.width, resized.height, resized.width * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimage)
+
+        self.canvas.setPixmap(pixmap)
+        self.canvas.setFixedSize(pixmap.size())
+
+        self.page_label.setText(f"페이지: {self.current_page_idx + 1} / {len(self.pages)}")
+        self._update_box_list()
+
+    def _get_box_sort_key(self, page_idx: int, box: QuestionBox) -> tuple:
+        """박스 정렬 키: 페이지 → 좌/우 컬럼 → Y 좌표"""
+        # 페이지 중앙을 기준으로 좌/우 컬럼 판단
+        if self.pages:
+            page_width = self.pages[page_idx].width if page_idx < len(self.pages) else 1000
+        else:
+            page_width = 1000
+        mid_x = page_width / 2
+
+        # 박스 중앙 X 좌표로 좌/우 판단
+        box_center_x = (box.x1 + box.x2) / 2
+        column = 0 if box_center_x < mid_x else 1  # 0: 왼쪽, 1: 오른쪽
+
+        return (page_idx, column, box.y1)
+
+    def _rebuild_sorted_boxes(self):
+        """정렬된 박스 목록 재구성"""
+        # 모든 박스를 (page_idx, box) 튜플로 수집
+        all_boxes = []
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                all_boxes.append((page_idx, box))
+
+        # 위치 기준으로 정렬
+        self._sorted_boxes = sorted(all_boxes, key=lambda x: self._get_box_sort_key(x[0], x[1]))
+
+    def _update_box_list(self):
+        """전체 박스 목록 업데이트 (테마별 그룹화)"""
+        # 선택된 박스들 저장 (box 객체로 저장)
+        selected_boxes = set()
+        for item in self.box_list.selectedItems():
+            row = self.box_list.row(item)
+            if row >= 0 and row < len(self._box_index_map):
+                entry = self._box_index_map[row]
+                if entry is not None:
+                    selected_boxes.add(id(entry[1]))  # box 객체의 id
+
+        self.box_list.clear()
+        self._box_index_map = []  # list_idx -> (page_idx, box) 또는 None(헤더)
+
+        # 정렬된 목록이 없거나 박스 수가 다르면 재구성
+        total_boxes = sum(len(boxes) for boxes in self.boxes.values())
+        if len(self._sorted_boxes) != total_boxes:
+            self._rebuild_sorted_boxes()
+
+        # 테마별로 박스 분류
+        theme_boxes: Dict[Optional[str], List[tuple]] = {}  # theme_id -> [(page_idx, box), ...]
+        for page_idx, box in self._sorted_boxes:
+            theme_id = box.theme_id
+            if theme_id not in theme_boxes:
+                theme_boxes[theme_id] = []
+            theme_boxes[theme_id].append((page_idx, box))
+
+        # 페이지별 박스 카운터 (전체 기준)
+        page_box_counts: Dict[int, int] = {}
+        for page_idx, box in self._sorted_boxes:
+            if page_idx not in page_box_counts:
+                page_box_counts[page_idx] = 0
+            page_box_counts[page_idx] += 1
+
+        # 테마 순서대로 표시 (등록된 테마 순서 → 미지정)
+        # 빈 테마도 표시하기 위해 모든 테마를 순회
+        theme_order = [t.id for t in self.themes] + [None]
+
+        # 접힌 테마 정보 가져오기
+        collapsed_themes = self.box_list._collapsed_themes
+
+        for theme_id in theme_order:
+            boxes_in_theme = theme_boxes.get(theme_id, [])
+            theme = self.get_theme_by_id(theme_id) if theme_id else None
+
+            # 미지정(None)은 박스가 있을 때만 표시
+            if theme_id is None and not boxes_in_theme:
+                continue
+
+            # 접힌 상태 확인
+            collapse_key = theme_id if theme_id else "__none__"
+            is_collapsed = collapse_key in collapsed_themes
+            arrow = "▶" if is_collapsed else "▼"
+
+            # 테마 헤더 추가
+            if theme:
+                header_text = f"{arrow} {theme.name} ({len(boxes_in_theme)})"
+                header_item = QListWidgetItem(header_text)
+                header_item.setForeground(QColor(theme.color))
+                header_item.setBackground(QColor(theme.color).lighter(180))
+                header_item.setFlags(header_item.flags() & ~Qt.ItemIsSelectable)  # 선택 불가
+                font = header_item.font()
+                font.setBold(True)
+                header_item.setFont(font)
+            else:
+                header_text = f"{arrow} (미지정) ({len(boxes_in_theme)})"
+                header_item = QListWidgetItem(header_text)
+                header_item.setForeground(QColor("#888888"))
+                header_item.setFlags(header_item.flags() & ~Qt.ItemIsSelectable)
+                font = header_item.font()
+                font.setBold(True)
+                header_item.setFont(font)
+
+            self.box_list.addItem(header_item)
+            self._box_index_map.append(None)  # 헤더는 None
+
+            # 접힌 상태면 박스 항목 건너뛰기
+            if is_collapsed:
+                continue
+
+            # 해당 테마의 박스들 추가
+            # 페이지 내 순번 재계산 (테마 내에서)
+            theme_page_counts: Dict[int, int] = {}
+            for page_idx, box in boxes_in_theme:
+                if page_idx not in theme_page_counts:
+                    theme_page_counts[page_idx] = 0
+                theme_page_counts[page_idx] += 1
+                box_num_in_page = theme_page_counts[page_idx]
+
+                # 유형 아이콘
+                type_icon = "📝" if box.box_type == BOX_TYPE_QUESTION else "📖"
+
+                # 형식: 📝 05-01 (5페이지의 1번째 박스)
+                label = f"    {type_icon} {page_idx + 1:02d}-{box_num_in_page:02d}"
+                if box.number:
+                    label += f" #{box.number}"
+
+                # 풀이인 경우 연결된 문제 표시
+                if box.box_type == BOX_TYPE_SOLUTION and box.linked_box_id:
+                    linked_box = self.get_box_by_id(box.linked_box_id)
+                    if linked_box:
+                        link_label = f"→#{linked_box.number}" if linked_box.number else "→문제"
+                        label += f" {link_label}"
+
+                item = QListWidgetItem(label)
+                if theme:
+                    item.setForeground(QColor(theme.color))
+
+                # 현재 페이지 박스는 볼드체
+                if page_idx == self.current_page_idx:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+
+                self.box_list.addItem(item)
+                self._box_index_map.append((page_idx, box))
+
+                # 선택 상태 복원
+                if id(box) in selected_boxes:
+                    item.setSelected(True)
+
+    def _on_box_select(self, item):
+        """박스 선택 - 해당 페이지로 이동"""
+        list_idx = self.box_list.row(item)
+        if list_idx < 0 or list_idx >= len(self._box_index_map):
+            return
+
+        # 헤더 클릭 시 무시
+        map_entry = self._box_index_map[list_idx]
+        if map_entry is None:
+            return
+
+        page_idx, box = map_entry
+
+        # 다른 페이지면 이동
+        if page_idx != self.current_page_idx:
+            self.current_page_idx = page_idx
+            self._display_page()
+            self._update_thumbnail_highlight()
+
+        # 현재 페이지에서 이 박스의 인덱스 찾기
+        boxes = self.boxes.get(self.current_page_idx, [])
+        try:
+            self.current_box_id = boxes.index(box)
+        except ValueError:
+            self.current_box_id = None
+
+        self.canvas.update()
+
+        # 레이블 입력 필드 업데이트
+        self.number_input.setText(str(box.number) if box.number else "")
+
+        # 테마 콤보박스 업데이트
+        idx = 0
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == box.theme_id:
+                idx = i
+                break
+        self.theme_combo.setCurrentIndex(idx)
+
+        # 유형 콤보박스 업데이트
+        type_idx = 0
+        for i in range(self.type_combo.count()):
+            if self.type_combo.itemData(i) == box.box_type:
+                type_idx = i
+                break
+        self.type_combo.setCurrentIndex(type_idx)
+
+        # 연결 콤보박스 업데이트 (풀이인 경우)
+        if box.box_type == BOX_TYPE_SOLUTION:
+            self.link_label.show()
+            self.link_combo.show()
+            self._update_link_combo()
+            link_idx = 0
+            for i in range(self.link_combo.count()):
+                if self.link_combo.itemData(i) == box.linked_box_id:
+                    link_idx = i
+                    break
+            self.link_combo.setCurrentIndex(link_idx)
+        else:
+            self.link_label.hide()
+            self.link_combo.hide()
+
+        # 목록에서 현재 선택 항목 다시 선택 (페이지 이동 후에도 유지)
+        self.box_list.setCurrentRow(list_idx)
+
+    def _apply_label(self):
+        """레이블 적용"""
+        if self.current_box_id is None:
+            return
+
+        boxes = self.boxes.get(self.current_page_idx, [])
+        if not (0 <= self.current_box_id < len(boxes)):
+            return
+
+        box = boxes[self.current_box_id]
+
+        num_text = self.number_input.text().strip()
+        box.number = int(num_text) if num_text.isdigit() else None
+        old_theme_id = box.theme_id
+        box.theme_id = self.theme_combo.currentData()  # 테마 ID
+
+        # 유형 및 연결 정보 저장
+        old_box_type = box.box_type
+        box.box_type = self.type_combo.currentData()
+
+        # 풀이인 경우만 연결 정보 저장
+        if box.box_type == BOX_TYPE_SOLUTION:
+            box.linked_box_id = self.link_combo.currentData()
+        else:
+            box.linked_box_id = None  # 문제는 연결 정보 없음
+
+        self._update_box_list()
+        # 테마나 유형이 바뀌면 썸네일도 업데이트
+        if old_theme_id != box.theme_id or old_box_type != box.box_type:
+            self._update_thumbnail_boxes(self.current_page_idx)
+        self.canvas.update()
+        self._schedule_auto_save()  # 자동 저장
+
+    def _delete_selected_box(self):
+        """선택된 박스 삭제"""
+        list_idx = self.box_list.currentRow()
+        if list_idx < 0 or list_idx >= len(self._box_index_map):
+            return
+
+        map_entry = self._box_index_map[list_idx]
+        if map_entry is None:  # 헤더 클릭 시 무시
+            return
+
+        page_idx, box = map_entry
+
+        # boxes 딕셔너리에서 삭제
+        if page_idx in self.boxes and box in self.boxes[page_idx]:
+            self.boxes[page_idx].remove(box)
+
+        # 정렬 목록에서도 삭제
+        if (page_idx, box) in self._sorted_boxes:
+            self._sorted_boxes.remove((page_idx, box))
+
+        self.current_box_id = None
+        self._update_box_list()
+        self._update_thumbnail_boxes(page_idx)  # 썸네일 업데이트
+        self.canvas.update()
+        self._schedule_auto_save()  # 자동 저장
+
+    def _prev_page(self, scroll_to_bottom: bool = False):
+        """이전 페이지"""
+        if self.current_page_idx > 0:
+            self.current_page_idx -= 1
+            self.current_box_id = None
+            self._display_page()
+            self._update_thumbnail_highlight()
+            if scroll_to_bottom:
+                # 이전 페이지로 이동 후 맨 아래로 스크롤
+                self.scroll_area.verticalScrollBar().setValue(
+                    self.scroll_area.verticalScrollBar().maximum()
+                )
+
+    def _next_page(self, scroll_to_top: bool = False):
+        """다음 페이지"""
+        if self.current_page_idx < len(self.pages) - 1:
+            self.current_page_idx += 1
+            self.current_box_id = None
+            self._display_page()
+            self._update_thumbnail_highlight()
+            if scroll_to_top:
+                # 다음 페이지로 이동 후 맨 위로 스크롤
+                self.scroll_area.verticalScrollBar().setValue(
+                    self.scroll_area.verticalScrollBar().minimum()
+                )
+
+    def _zoom_in(self):
+        """확대"""
+        self.scale = min(3.0, self.scale + 0.1)
+        self.zoom_label.setText(f"{int(self.scale * 100)}%")
+        self._display_page()
+
+    def _zoom_out(self):
+        """축소"""
+        self.scale = max(0.2, self.scale - 0.1)
+        self.zoom_label.setText(f"{int(self.scale * 100)}%")
+        self._display_page()
+
+    def _fit_to_window(self):
+        """폭 맞춤 - PDF 폭을 작업 화면 폭에 맞춤"""
+        if not self.pages:
+            return
+
+        page = self.pages[self.current_page_idx]
+        # 스크롤 영역 폭 기준 (스크롤바 여유 포함)
+        available_width = self.scroll_area.viewport().width() - 20
+
+        self.scale = available_width / page.width
+
+        self.zoom_label.setText(f"{int(self.scale * 100)}%")
+        self._display_page()
+
+    def _save_labels(self):
+        """레이블 저장"""
+        if not self.pdf_path:
+            QMessageBox.warning(self, "경고", "PDF 파일이 열려있지 않습니다.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "레이블 저장", f"{self.pdf_path.stem}_labels.json",
+            "JSON files (*.json)"
+        )
+        if not file_path:
+            return
+
+        all_boxes = []
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                all_boxes.append(box.to_dict())
+
+        data = {
+            "source_pdf": self.pdf_path.name,
+            "created_at": datetime.now().isoformat(),
+            "total_boxes": len(all_boxes),
+            "boxes": all_boxes
+        }
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        self.status_label.setText(f"저장 완료: {Path(file_path).name}")
+        QMessageBox.information(self, "저장 완료", f"{len(all_boxes)}개 박스가 저장되었습니다.")
+
+    def _load_labels(self):
+        """레이블 불러오기"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "레이블 불러오기", "", "JSON files (*.json)"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # 테마 로드 (있는 경우)
+            if "themes" in data:
+                self.themes = []
+                self._theme_counter = 0
+                for theme_data in data.get("themes", []):
+                    theme = Theme(
+                        id=theme_data["id"],
+                        name=theme_data["name"],
+                        color=theme_data.get("color", "#3498db")
+                    )
+                    self.themes.append(theme)
+                    if theme.id.startswith("theme_"):
+                        try:
+                            num = int(theme.id.split("_")[1])
+                            self._theme_counter = max(self._theme_counter, num)
+                        except ValueError:
+                            pass
+                self._update_theme_list()
+                self._update_theme_combo()
+
+            self.boxes = {i: [] for i in range(len(self.pages))}
+            self._box_counter = 0
+            for box_data in data.get("boxes", []):
+                page_idx = box_data.get("page", 1) - 1
+                if 0 <= page_idx < len(self.pages):
+                    box = QuestionBox(
+                        x1=box_data["x1"],
+                        y1=box_data["y1"],
+                        x2=box_data["x2"],
+                        y2=box_data["y2"],
+                        number=box_data.get("number"),
+                        theme_id=box_data.get("theme_id"),
+                        page=box_data.get("page", 1),
+                        box_type=box_data.get("box_type", BOX_TYPE_QUESTION),
+                        linked_box_id=box_data.get("linked_box_id"),
+                        box_id=box_data.get("box_id")
+                    )
+                    # box_id가 없으면 생성
+                    if not box.box_id:
+                        box.box_id = self._generate_box_id()
+                    else:
+                        if box.box_id.startswith("box_"):
+                            try:
+                                num = int(box.box_id.split("_")[1])
+                                self._box_counter = max(self._box_counter, num)
+                            except ValueError:
+                                pass
+                    self.boxes[page_idx].append(box)
+
+            # 정렬 목록 재구성
+            self._rebuild_sorted_boxes()
+
+            self._display_page()
+            self.status_label.setText(f"불러오기 완료: {len(data.get('boxes', []))}개 박스")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"불러오기 실패: {e}")
+
+    def _export_images(self):
+        """박스 영역 이미지 내보내기"""
+        if not self.pdf_path:
+            QMessageBox.warning(self, "경고", "PDF 파일이 열려있지 않습니다.")
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(self, "이미지 저장 폴더 선택")
+        if not output_dir:
+            return
+
+        output_path = Path(output_dir)
+        images_dir = output_path / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        self.status_label.setText("고해상도 이미지 생성 중...")
+        QApplication.processEvents()
+
+        hires_pages = convert_from_path(str(self.pdf_path), dpi=300)
+        scale_factor = 300 / 150
+
+        exported = []
+        idx = 0
+
+        for page_idx, boxes in self.boxes.items():
+            if page_idx >= len(hires_pages):
+                continue
+
+            page = hires_pages[page_idx]
+
+            for box in boxes:
+                idx += 1
+                x1 = int(box.x1 * scale_factor)
+                y1 = int(box.y1 * scale_factor)
+                x2 = int(box.x2 * scale_factor)
+                y2 = int(box.y2 * scale_factor)
+
+                cropped = page.crop((x1, y1, x2, y2))
+                filename = f"q{idx:03d}.png"
+                cropped.save(images_dir / filename, "PNG")
+
+                # 테마 정보
+                theme_info = None
+                if box.theme_id:
+                    theme = self.get_theme_by_id(box.theme_id)
+                    if theme:
+                        theme_info = {"id": theme.id, "name": theme.name}
+
+                exported.append({
+                    "id": f"q{idx:03d}",
+                    "number": box.number,
+                    "theme": theme_info,
+                    "image_path": f"images/{filename}",
+                    "source_page": page_idx + 1,
+                    "bbox": {"x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2}
+                })
+
+        metadata = {
+            "source_pdf": self.pdf_path.name,
+            "exported_at": datetime.now().isoformat(),
+            "total_questions": len(exported),
+            "questions": exported
+        }
+
+        with open(output_path / "metadata.json", 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+        self.status_label.setText(f"내보내기 완료: {len(exported)}개")
+        QMessageBox.information(self, "완료", f"{len(exported)}개 이미지가 내보내기 되었습니다.\n{output_path}")
+
+
+def main():
+    import traceback
+    from PyQt5.QtNetwork import QLocalServer, QLocalSocket
+
+    # 전역 예외 핸들러 설정
+    def exception_hook(exctype, value, tb):
+        print("=" * 50)
+        print("예외 발생!")
+        print("=" * 50)
+        traceback.print_exception(exctype, value, tb)
+        print("=" * 50)
+        sys.__excepthook__(exctype, value, tb)
+
+    sys.excepthook = exception_hook
+
+    # macOS 메뉴바 앱 이름 설정 (QApplication 생성 전에 설정)
+    if sys.platform == "darwin":
+        try:
+            from Foundation import NSBundle
+            bundle = NSBundle.mainBundle()
+            info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+            if info:
+                info["CFBundleName"] = "문항 레이블러"
+        except ImportError:
+            pass
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("문항 레이블러")
+    app.setApplicationDisplayName("문항 레이블러")
+    app.setOrganizationName("MilliSquare")
+
+    # 싱글톤: 이미 실행 중인 인스턴스 확인
+    socket = QLocalSocket()
+    socket.connectToServer("PDFLabeler_SingleInstance")
+    if socket.waitForConnected(500):
+        # 이미 실행 중이면 기존 창 활성화 요청 후 종료
+        socket.close()
+        print("앱이 이미 실행 중입니다.")
+        sys.exit(0)
+
+    # 서버 생성 (다른 인스턴스 감지용)
+    server = QLocalServer()
+    server.removeServer("PDFLabeler_SingleInstance")  # 이전 서버 정리
+    server.listen("PDFLabeler_SingleInstance")
+
+    window = PDFLabeler()
+    window.show()
+
+    # 다른 인스턴스에서 연결 시 창 활성화
+    def activate_window():
+        window.raise_()
+        window.activateWindow()
+
+    server.newConnection.connect(activate_window)
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
