@@ -27,6 +27,7 @@ class Theme:
     id: str
     name: str
     color: str = "#3498db"  # 기본 파란색
+    deleted: bool = False  # 삭제 표시 (실제 삭제 아님)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -170,6 +171,8 @@ class BoxListWidget(QListWidget):
     theme_selected = pyqtSignal(list, object)
     # 타입 변경 시그널: (box_items: list of (page_idx, box), box_type)
     type_changed = pyqtSignal(list, str)
+    # 해설 연결 시그널: (solution_items: list of (page_idx, box), question_box_id)
+    solution_linked = pyqtSignal(list, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -225,17 +228,11 @@ class BoxListWidget(QListWidget):
         return None
 
     def mousePressEvent(self, event):
-        """마우스 누름 - 헤더 클릭시 접기/펼치기, 드래그 시작점 기록"""
+        """마우스 누름 - 드래그 시작점 기록 (Shift 멀티 선택 지원)"""
         if event.button() == Qt.LeftButton:
-            item = self.itemAt(event.pos())
-            if item:
-                row = self.row(item)
-                # 테마 헤더 클릭 - 접기/펼치기
-                if self._is_header_row(row):
-                    self._toggle_theme(item)
-                    return  # 헤더 클릭은 선택 등 기본 동작 막음
             self._drag_start_pos = event.pos()
             self._dragging = False
+        # 기본 동작 수행 (Shift/Ctrl 멀티 선택 포함)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -333,10 +330,9 @@ class BoxListWidget(QListWidget):
         menu.addSeparator()
 
         for theme in self._parent_window.themes:
-            pixmap = QPixmap(12, 12)
-            pixmap.fill(QColor(theme.color))
-            action = menu.addAction(QIcon(pixmap), theme.name)
-            action.setData(theme.id)
+            if not theme.deleted:
+                action = menu.addAction(theme.name)
+                action.setData(theme.id)
 
         action = menu.exec_(global_pos)
         if action:
@@ -367,10 +363,9 @@ class BoxListWidget(QListWidget):
         none_action.setData(("theme", None))
         theme_menu.addSeparator()
         for theme in self._parent_window.themes:
-            pixmap = QPixmap(12, 12)
-            pixmap.fill(QColor(theme.color))
-            action = theme_menu.addAction(QIcon(pixmap), theme.name)
-            action.setData(("theme", theme.id))
+            if not theme.deleted:
+                action = theme_menu.addAction(theme.name)
+                action.setData(("theme", theme.id))
 
         # 해설인 경우 문제 연결 메뉴 추가
         # 선택된 박스가 하나이고 해설 타입인 경우
@@ -428,7 +423,7 @@ class BoxListWidget(QListWidget):
             event.ignore()
 
     def dragMoveEvent(self, event):
-        """드래그 이동 - 테마 헤더 위에서만 허용, 하이라이트 표시"""
+        """드래그 이동 - 테마 헤더 또는 문제 박스 위에서 허용, 하이라이트 표시"""
         if not event.mimeData().hasFormat("application/x-boxlist"):
             event.ignore()
             return
@@ -443,14 +438,29 @@ class BoxListWidget(QListWidget):
         item = self.itemAt(event.pos())
         if item:
             row = self.row(item)
-            # 테마 헤더 위에서만 드롭 허용
+            box_map = self._get_box_index_map()
+
+            # 테마 헤더 위에서 드롭 허용
             if self._is_header_row(row):
-                # 하이라이트 효과
                 self._original_bg = item.background()
                 self._highlighted_row = row
                 item.setBackground(QColor("#90EE90"))  # 연한 초록색
                 event.acceptProposedAction()
                 return
+
+            # 문제 박스 위에서 해설 드롭 허용
+            if 0 <= row < len(box_map) and box_map[row] is not None:
+                _, target_box = box_map[row]
+                if target_box.box_type == "question":
+                    # 드래그 중인 항목이 해설인지 확인
+                    dragged_boxes = self._get_selected_boxes()
+                    all_solutions = dragged_boxes and all(b.box_type == "solution" for _, b in dragged_boxes)
+                    if all_solutions:
+                        self._original_bg = item.background()
+                        self._highlighted_row = row
+                        item.setBackground(QColor("#87CEEB"))  # 연한 파란색 (해설→문제 연결)
+                        event.acceptProposedAction()
+                        return
 
         event.ignore()
 
@@ -463,8 +473,27 @@ class BoxListWidget(QListWidget):
             self._highlighted_row = -1
         event.accept()
 
+    def _get_theme_id_for_row(self, row):
+        """해당 행이 속한 테마 ID를 반환 (헤더 또는 박스 항목 모두 처리)"""
+        box_map = self._get_box_index_map()
+        if row < 0 or row >= len(box_map):
+            return None
+
+        # 헤더인 경우 직접 테마 ID 반환
+        if box_map[row] is None:
+            item = self.item(row)
+            return self._get_theme_id_from_header(item) if item else None
+
+        # 박스인 경우 위로 올라가며 헤더 찾기
+        for i in range(row, -1, -1):
+            if box_map[i] is None:  # 헤더 찾음
+                item = self.item(i)
+                return self._get_theme_id_from_header(item) if item else None
+
+        return None
+
     def dropEvent(self, event):
-        """드롭 - 테마 헤더에 박스 할당"""
+        """드롭 - 테마 헤더/항목에 박스 할당 또는 해설을 문제에 연결"""
         # 하이라이트 제거
         if hasattr(self, '_highlighted_row') and self._highlighted_row >= 0:
             old_item = self.item(self._highlighted_row)
@@ -486,12 +515,6 @@ class BoxListWidget(QListWidget):
             return
 
         row = self.row(item)
-        if not self._is_header_row(row):
-            event.ignore()
-            return
-
-        # 드롭 대상 테마 ID
-        target_theme_id = self._get_theme_id_from_header(item)
 
         # 드래그된 박스들 파싱
         data = event.mimeData().data("application/x-boxlist").data().decode('utf-8')
@@ -509,11 +532,31 @@ class BoxListWidget(QListWidget):
             except ValueError:
                 continue
 
-        if box_items:
-            self.theme_changed.emit(box_items, target_theme_id)
-            event.acceptProposedAction()
-        else:
+        if not box_items:
             event.ignore()
+            return
+
+        # 드롭 대상이 박스 항목인지 확인
+        box_map = self._get_box_index_map()
+        target_entry = box_map[row] if 0 <= row < len(box_map) else None
+
+        # 드롭 대상이 문제 박스이고, 드래그 항목이 모두 해설인 경우 → 연결
+        if target_entry is not None:
+            target_page_idx, target_box = target_entry
+            # 드롭 대상이 문제 타입인지 확인
+            if target_box.box_type == "question":
+                # 드래그된 항목이 모두 해설인지 확인
+                all_solutions = all(b.box_type == "solution" for _, b in box_items)
+                if all_solutions:
+                    # 해설을 문제에 연결
+                    self.solution_linked.emit(box_items, target_box.box_id)
+                    event.acceptProposedAction()
+                    return
+
+        # 기존 로직: 테마 변경
+        target_theme_id = self._get_theme_id_for_row(row)
+        self.theme_changed.emit(box_items, target_theme_id)
+        event.acceptProposedAction()
 
 
 class ImageCanvas(QLabel):
@@ -649,17 +692,15 @@ class ImageCanvas(QLabel):
                 scale = parent.scale
                 current_page = parent.current_page_idx
 
-                # 현재 페이지의 박스별 순번 계산 (테마별)
+                # 테마 내 전체 순번 계산 (페이지 상관없이)
                 box_labels = {}
-                theme_page_counts = {}
+                theme_counts = {}
                 for page_idx, b in parent._sorted_boxes:
-                    if page_idx != current_page:
-                        continue
                     theme_id = b.theme_id or "__none__"
-                    if theme_id not in theme_page_counts:
-                        theme_page_counts[theme_id] = 0
-                    theme_page_counts[theme_id] += 1
-                    box_labels[id(b)] = theme_page_counts[theme_id]
+                    if theme_id not in theme_counts:
+                        theme_counts[theme_id] = 0
+                    theme_counts[theme_id] += 1
+                    box_labels[id(b)] = theme_counts[theme_id]
 
                 for i, box in enumerate(boxes):
                     x1 = int(box.x1 * scale)
@@ -670,9 +711,6 @@ class ImageCanvas(QLabel):
                     # 테마 색상 또는 기본 색상
                     if i == selected_idx:
                         color = QColor(255, 0, 0)  # 선택된 박스: 빨강
-                    elif box.theme_id:
-                        theme = parent.get_theme_by_id(box.theme_id)
-                        color = QColor(theme.color) if theme else QColor(0, 0, 255)
                     else:
                         color = QColor(0, 0, 255)  # 기본: 파랑
 
@@ -683,20 +721,21 @@ class ImageCanvas(QLabel):
                     painter.setPen(pen)
                     painter.drawRect(x1, y1, x2 - x1, y2 - y1)
 
-                    # 레이블 (박스 목록과 동일한 형식: 01-01 #번호)
+                    # 레이블 (테마명-순번 형식)
                     box_num = box_labels.get(id(box), i + 1)
                     type_icon = "📝" if box.box_type == BOX_TYPE_QUESTION else "📖"
-                    label = f"{type_icon} {current_page + 1:02d}-{box_num:02d}"
-                    if box.number:
-                        label += f" #{box.number}"
+                    theme_name = "미지정"
                     if box.theme_id:
                         theme = parent.get_theme_by_id(box.theme_id)
                         if theme:
-                            label += f" {theme.name}"
-                    # 풀이 선 스타일 복원하고 텍스트 그리기
+                            theme_name = theme.name
+                    label = f"{type_icon} {theme_name}-{box_num:02d}"
+                    if box.number:
+                        label += f" #{box.number}"
+                    # 풀이 선 스타일 복원하고 텍스트 그리기 (박스 바로 위)
                     pen.setStyle(Qt.SolidLine)
                     painter.setPen(pen)
-                    painter.drawText(x1 + 5, y1 + 15, label)
+                    painter.drawText(x1, y1 - 5, label)
 
                     # 삭제 버튼 (박스 오른쪽 상단에 X 버튼)
                     btn_size = self.DELETE_BTN_SIZE
@@ -738,7 +777,7 @@ class PDFLabeler(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF 문항 레이블러")
+        self.setWindowTitle("PDF 문항 레이블러 v0.9")
 
         # 설정 (최근 파일, 창 위치/크기 저장용)
         self.settings = QSettings("PDFLabeler", "PDFLabeler")
@@ -759,6 +798,8 @@ class PDFLabeler(QMainWindow):
         self.themes: List[Theme] = []  # 테마 목록
         self._theme_counter = 0  # 테마 ID 생성용
         self._box_counter = 0  # 박스 ID 생성용
+        self._current_theme_id: Optional[str] = None  # 현재 선택된 테마 (새 박스에 자동 적용)
+        self._undo_state: Optional[dict] = None  # 1단계 Undo용 이전 상태
 
         # 자동 저장 타이머 (변경 후 2초 뒤 저장)
         self._auto_save_timer = QTimer()
@@ -804,6 +845,14 @@ class PDFLabeler(QMainWindow):
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
+
+        # 편집 메뉴
+        edit_menu = menubar.addMenu("편집")
+
+        undo_action = QAction("실행 취소", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self._undo)
+        edit_menu.addAction(undo_action)
 
     def _update_recent_menu(self):
         """최근 항목 메뉴 업데이트"""
@@ -859,11 +908,11 @@ class PDFLabeler(QMainWindow):
         """프로그램 소개 메시지 표시"""
         welcome_text = """
 <div style="padding: 40px; font-family: sans-serif; max-width: 600px;">
-<h1 style="color: #333; text-align: center;">📄 PDF 문항 레이블러</h1>
-<p style="color: #666; font-size: 14px; text-align: center;">PDF 문서에서 문항을 박싱하고 레이블링하는 도구입니다.</p>
+<h1 style="text-align: center;">📄 PDF 문항 레이블러</h1>
+<p style="font-size: 14px; text-align: center; opacity: 0.7;">PDF 문서에서 문항을 박싱하고 레이블링하는 도구입니다.</p>
 
-<h3 style="color: #444; margin-top: 30px;">✨ 주요 기능</h3>
-<ul style="color: #555; line-height: 1.8;">
+<h3 style="margin-top: 30px;">✨ 주요 기능</h3>
+<ul style="line-height: 1.8;">
 <li><a href="action:open_pdf" style="color: #4a90d9; text-decoration: none;"><b>PDF 열기</b></a> - PDF 파일을 불러와 페이지별로 탐색</li>
 <li><b>박스 그리기</b> - 마우스 드래그로 문항 영역 선택</li>
 <li><b>레이블링</b> - 문항 번호와 테마/주제 입력</li>
@@ -872,20 +921,24 @@ class PDFLabeler(QMainWindow):
 <li><b>이미지 내보내기</b> - 고해상도(300 DPI) 이미지 추출</li>
 </ul>
 
-<h3 style="color: #444; margin-top: 30px;">⌨️ 단축키</h3>
-<ul style="color: #555; line-height: 1.8;">
+<h3 style="margin-top: 30px;">⌨️ 단축키</h3>
+<ul style="line-height: 1.8;">
 <li><b>← / →</b> - 이전/다음 페이지</li>
 <li><b>Delete</b> - 선택된 박스 삭제</li>
 <li><b>+ / -</b> - 확대/축소</li>
 <li><b>스크롤</b> - 페이지 끝에서 추가 스크롤 시 페이지 이동</li>
 </ul>
 
-<p style="color: #888; margin-top: 40px; font-size: 12px; text-align: center;">
+<p style="margin-top: 40px; font-size: 12px; text-align: center; opacity: 0.7;">
 👉 <a href="action:open_pdf" style="color: #4a90d9;"><b>PDF 열기</b></a>를 클릭하거나<br>
 우측 패널에서 최근 항목을 선택하세요.
 </p>
 
-<p style="color: #aaa; margin-top: 50px; font-size: 11px; text-align: center;">
+<p style="margin-top: 30px; font-size: 12px; text-align: center; opacity: 0.7;">
+📖 <a href="action:show_manual" style="color: #4a90d9;">사용자 매뉴얼 보기</a>
+</p>
+
+<p style="margin-top: 30px; font-size: 11px; text-align: center; opacity: 0.5;">
 © 2026 MilliSquare
 </p>
 </div>
@@ -894,7 +947,6 @@ class PDFLabeler(QMainWindow):
 
         # 컨테이너 위젯 생성 (수직 중앙 정렬용)
         container = QWidget()
-        container.setStyleSheet("background-color: #f9f9f9;")
         layout = QVBoxLayout(container)
         layout.setAlignment(Qt.AlignCenter)
 
@@ -904,7 +956,7 @@ class PDFLabeler(QMainWindow):
         self.welcome_label.setOpenLinks(False)  # 링크 자동 열기 비활성화
         self.welcome_label.anchorClicked.connect(self._on_welcome_link_clicked)
         self.welcome_label.setHtml(welcome_text)
-        self.welcome_label.setStyleSheet("background-color: #f9f9f9; border: none;")
+        self.welcome_label.setStyleSheet("border: none;")
         self.welcome_label.setFixedSize(650, 550)
         self.welcome_label.setFrameShape(QFrame.NoFrame)
 
@@ -915,6 +967,101 @@ class PDFLabeler(QMainWindow):
         """Welcome 메시지 링크 클릭 처리"""
         if url.toString() == "action:open_pdf":
             self._open_pdf()
+        elif url.toString() == "action:show_manual":
+            self._show_manual()
+        elif url.toString() == "action:back_to_welcome":
+            self._show_welcome_message()
+
+    def _show_manual(self):
+        """사용자 매뉴얼 표시"""
+        manual_text = """
+<div style="padding: 30px; font-family: sans-serif; max-width: 700px;">
+<h1 style="text-align: center;">📖 사용자 매뉴얼</h1>
+
+<h2 style="margin-top: 25px; border-bottom: 1px solid gray; padding-bottom: 5px;">설치 및 실행</h2>
+<ol style="line-height: 1.8;">
+<li><code>PDF문항레이블러.zip</code> 압축 해제</li>
+<li><code>PDF문항레이블러.app</code> 더블클릭하여 실행</li>
+<li>첫 실행 시 "확인되지 않은 개발자" 경고: 우클릭 → 열기</li>
+</ol>
+
+<h2 style="margin-top: 25px; border-bottom: 1px solid gray; padding-bottom: 5px;">테마(단원) 관리</h2>
+<ul style="line-height: 1.8;">
+<li>왼쪽 <b>테마 목록</b>에서 테마 추가/삭제</li>
+<li><b>+</b> 버튼: 새 테마 추가 (입력 후 Enter)</li>
+<li><b>-</b> 버튼: 선택된 테마 삭제</li>
+<li>테마 클릭 시 해당 테마가 선택됨 (새 박스에 자동 적용)</li>
+</ul>
+
+<h2 style="margin-top: 25px; border-bottom: 1px solid gray; padding-bottom: 5px;">박싱 작업</h2>
+<h3>문제/해설 박스 생성</h3>
+<ol style="line-height: 1.8;">
+<li>테마를 먼저 선택</li>
+<li><b>해설 입력</b> 체크박스:
+    <ul>
+    <li>체크 해제: 문제 박스 생성</li>
+    <li>체크: 해설 박스 생성</li>
+    </ul>
+</li>
+<li>PDF 위에서 드래그하여 영역 선택</li>
+</ol>
+
+<h3>박스 삭제</h3>
+<ul style="line-height: 1.8;">
+<li>PDF에서: 박스 위 우클릭</li>
+<li>목록에서: 선택 후 <code>Delete</code> 키</li>
+</ul>
+
+<h3>박스 테마 변경</h3>
+<ul style="line-height: 1.8;">
+<li>전체 박스 목록에서 박스를 드래그하여 다른 테마 헤더에 드롭</li>
+</ul>
+
+<h2 style="margin-top: 25px; border-bottom: 1px solid gray; padding-bottom: 5px;">해설 연결</h2>
+<p style="line-height: 1.8;">해설 박스를 문제에 연결하는 방법:</p>
+<ol style="line-height: 1.8;">
+<li>전체 박스 목록에서 <b>해설 항목</b>을 선택</li>
+<li><b>문제 항목</b> 위로 드래그&드롭</li>
+<li>연결되면 해설이 문제 아래에 들여쓰기로 표시됨</li>
+</ol>
+<pre style="padding: 10px; border-radius: 5px; font-size: 12px; opacity: 0.8;">
+▼ 수열의 극한 (2)
+    📝 수열의 극한-01
+        └ 📖 수열의 극한-01-01 해설
+    📝 수열의 극한-02
+</pre>
+
+<h2 style="margin-top: 25px; border-bottom: 1px solid gray; padding-bottom: 5px;">단축키</h2>
+<table style="width: 100%; border-collapse: collapse;">
+<tr><th style="padding: 8px; text-align: left; border-bottom: 1px solid gray;">단축키</th><th style="padding: 8px; text-align: left; border-bottom: 1px solid gray;">기능</th></tr>
+<tr><td style="padding: 8px;"><code>Cmd+O</code></td><td style="padding: 8px;">PDF 열기</td></tr>
+<tr><td style="padding: 8px;"><code>Cmd+E</code></td><td style="padding: 8px;">이미지 내보내기</td></tr>
+<tr><td style="padding: 8px;"><code>Cmd+Z</code></td><td style="padding: 8px;">실행 취소 (1단계)</td></tr>
+<tr><td style="padding: 8px;"><code>Delete</code></td><td style="padding: 8px;">선택된 박스 삭제</td></tr>
+<tr><td style="padding: 8px;"><code>← / →</code></td><td style="padding: 8px;">이전/다음 페이지</td></tr>
+<tr><td style="padding: 8px;"><code>Shift+클릭</code></td><td style="padding: 8px;">다중 선택</td></tr>
+</table>
+
+<h2 style="margin-top: 25px; border-bottom: 1px solid gray; padding-bottom: 5px;">저장 및 내보내기</h2>
+<h3>자동 저장</h3>
+<ul style="line-height: 1.8;">
+<li>모든 작업은 자동으로 저장됨 (<code>.json</code> 파일)</li>
+<li>PDF와 같은 폴더에 <code>PDF파일명_labels.json</code>으로 저장</li>
+</ul>
+
+<h3>이미지 내보내기</h3>
+<ul style="line-height: 1.8;">
+<li><b>메뉴</b>: 파일 → 이미지 내보내기 (<code>Cmd+E</code>)</li>
+<li>각 박스가 개별 이미지로 저장됨</li>
+</ul>
+
+<p style="margin-top: 40px; font-size: 12px; text-align: center; opacity: 0.7;">
+<a href="action:back_to_welcome" style="color: #4a90d9;">← 처음으로 돌아가기</a>
+</p>
+</div>
+"""
+        self.welcome_label.setHtml(manual_text)
+        self.welcome_label.setFixedSize(750, 800)
 
     def _get_works_dir(self) -> Optional[Path]:
         """PDF 파일 위치의 .works 폴더 경로 반환"""
@@ -1110,8 +1257,8 @@ class PDFLabeler(QMainWindow):
 
         # 좌측: 썸네일 패널 (토글 버튼 포함)
         self.thumbnail_panel = QWidget()
-        self.thumbnail_panel.setMaximumWidth(120)
-        self.thumbnail_panel.setMinimumWidth(100)
+        self.thumbnail_panel.setMinimumWidth(80)
+        self.thumbnail_panel.setMaximumWidth(300)
         thumbnail_layout = QVBoxLayout(self.thumbnail_panel)
         thumbnail_layout.setContentsMargins(2, 2, 2, 2)
 
@@ -1139,6 +1286,14 @@ class PDFLabeler(QMainWindow):
         thumbnail_layout.addWidget(self.thumbnail_scroll)
         splitter.addWidget(self.thumbnail_panel)
 
+        # 스플리터 크기 변경 시 썸네일 재렌더링 (디바운싱)
+        self._main_splitter = splitter
+        splitter.splitterMoved.connect(self._on_splitter_moved)
+        self._last_thumbnail_width = 0
+        self._thumbnail_resize_timer = QTimer()
+        self._thumbnail_resize_timer.setSingleShot(True)
+        self._thumbnail_resize_timer.timeout.connect(self._delayed_thumbnail_resize)
+
         # 처음에는 썸네일 패널 숨기기
         self.thumbnail_panel.hide()
         self._sidebar_visible = True  # 사이드바 표시 상태
@@ -1151,7 +1306,49 @@ class PDFLabeler(QMainWindow):
         self.sidebar_show_btn.hide()
         main_layout.insertWidget(0, self.sidebar_show_btn)
 
-        # 중앙: 이미지 캔버스
+        # 중앙: 이미지 캔버스 + 상단 줌 바
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+
+        # 상단 줌 툴바 (얇은 패널)
+        zoom_bar = QWidget()
+        zoom_bar.setFixedHeight(35)
+        zoom_bar.setStyleSheet("border-bottom: 1px solid palette(mid);")
+        zoom_bar_layout = QHBoxLayout(zoom_bar)
+        zoom_bar_layout.setContentsMargins(10, 2, 10, 2)
+
+        zoom_bar_layout.addStretch()
+
+        btn_zoom_out = QPushButton("−")
+        btn_zoom_out.setFixedSize(28, 28)
+        btn_zoom_out.setToolTip("축소")
+        btn_zoom_out.clicked.connect(self._zoom_out)
+        zoom_bar_layout.addWidget(btn_zoom_out)
+
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(50)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        zoom_bar_layout.addWidget(self.zoom_label)
+
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_in.setFixedSize(28, 28)
+        btn_zoom_in.setToolTip("확대")
+        btn_zoom_in.clicked.connect(self._zoom_in)
+        zoom_bar_layout.addWidget(btn_zoom_in)
+
+        btn_fit = QPushButton("맞춤")
+        btn_fit.setFixedSize(45, 28)
+        btn_fit.setToolTip("화면 폭에 맞춤")
+        btn_fit.clicked.connect(self._fit_to_window)
+        zoom_bar_layout.addWidget(btn_fit)
+
+        zoom_bar_layout.addStretch()
+
+        center_layout.addWidget(zoom_bar)
+
+        # 이미지 캔버스
         self.scroll_area = ScrollAreaWithPageNav()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.page_next.connect(lambda: self._next_page(scroll_to_top=True))
@@ -1159,7 +1356,9 @@ class PDFLabeler(QMainWindow):
         self.canvas = ImageCanvas(self)
         self.canvas.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.scroll_area.setWidget(self.canvas)
-        splitter.addWidget(self.scroll_area)
+        center_layout.addWidget(self.scroll_area)
+
+        splitter.addWidget(center_widget)
 
         # 우측: 컨트롤 패널
         control_panel = QWidget()
@@ -1167,91 +1366,55 @@ class PDFLabeler(QMainWindow):
         control_layout = QVBoxLayout(control_panel)
         control_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 상단 영역 (테마 위)
-        top_widget = QWidget()
-        top_layout = QVBoxLayout(top_widget)
-        top_layout.setContentsMargins(5, 5, 5, 5)
+        # 우측 패널 레이아웃
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.setSpacing(10)
 
         # 교재 이름 표시
         self.textbook_label = QLabel("교재: (없음)")
-        self.textbook_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
+        self.textbook_label.setStyleSheet("font-weight: bold; font-size: 12px; padding: 5px; background-color: palette(midlight); border-radius: 3px;")
         self.textbook_label.setWordWrap(True)
-        top_layout.addWidget(self.textbook_label)
+        right_layout.addWidget(self.textbook_label)
 
-        # 상단 툴바 (확대/축소)
-        toolbar_layout = QHBoxLayout()
+        # 테마 헤더 (레이블 + 추가/삭제 버튼)
+        theme_header = QHBoxLayout()
+        theme_header.setContentsMargins(0, 0, 0, 0)
+        theme_label = QLabel("테마")
+        theme_label.setStyleSheet("font-weight: bold; padding: 3px;")
+        theme_header.addWidget(theme_label)
+        theme_header.addStretch()
+        self.theme_delete_btn = QPushButton("-")
+        self.theme_delete_btn.setFixedSize(24, 24)
+        self.theme_delete_btn.setToolTip("선택된 테마 삭제/복원")
+        self.theme_delete_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #da190b; }
+        """)
+        self.theme_delete_btn.clicked.connect(self._toggle_theme_deleted)
+        theme_header.addWidget(self.theme_delete_btn)
+        right_layout.addLayout(theme_header)
 
-        btn_zoom_out = QPushButton("−")
-        btn_zoom_out.setFixedSize(30, 30)
-        btn_zoom_out.setToolTip("축소")
-        btn_zoom_out.clicked.connect(self._zoom_out)
-        toolbar_layout.addWidget(btn_zoom_out)
-
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setFixedWidth(50)
-        self.zoom_label.setAlignment(Qt.AlignCenter)
-        toolbar_layout.addWidget(self.zoom_label)
-
-        btn_zoom_in = QPushButton("+")
-        btn_zoom_in.setFixedSize(30, 30)
-        btn_zoom_in.setToolTip("확대")
-        btn_zoom_in.clicked.connect(self._zoom_in)
-        toolbar_layout.addWidget(btn_zoom_in)
-
-        btn_fit = QPushButton("맞춤")
-        btn_fit.setFixedSize(50, 30)
-        btn_fit.setToolTip("화면 폭에 맞춤")
-        btn_fit.clicked.connect(self._fit_to_window)
-        toolbar_layout.addWidget(btn_fit)
-
-        toolbar_layout.addStretch()
-        top_layout.addLayout(toolbar_layout)
-
-        # 페이지 정보 (읽기 전용)
-        self.page_label = QLabel("페이지: 0 / 0")
-        self.page_label.setAlignment(Qt.AlignCenter)
-        top_layout.addWidget(self.page_label)
-
-        # 테마 관리
-        theme_group = QGroupBox("테마 (더블클릭으로 박스에 할당)")
-        theme_layout = QVBoxLayout(theme_group)
-
+        # 테마 목록 (스크롤 가능)
         self.theme_list = ThemeListWidget()
-        self.theme_list.setMaximumHeight(120)
+        self.theme_list.setMinimumHeight(80)
+        self.theme_list.setMaximumHeight(200)  # 최대 높이 제한, 넘으면 스크롤
+        self.theme_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.theme_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # 테마 순서는 self.themes 리스트 순서를 따름 (자동 정렬 비활성화)
         self.theme_list.itemClicked.connect(self._on_theme_select)
         self.theme_list.itemDoubleClicked.connect(self._on_theme_double_click)
         self.theme_list.itemChanged.connect(self._on_theme_item_changed)
         self.theme_list.box_dropped.connect(self._on_box_dropped_to_theme)
         self.theme_list.viewport().installEventFilter(self)  # 빈 영역 더블클릭 감지
-        theme_layout.addWidget(self.theme_list)
-
-        theme_btn_layout = QHBoxLayout()
-        btn_add_theme = QPushButton("+")
-        btn_add_theme.setFixedWidth(30)
-        btn_add_theme.setToolTip("테마 추가")
-        btn_add_theme.clicked.connect(self._add_theme)
-        theme_btn_layout.addWidget(btn_add_theme)
-
-        btn_edit_theme = QPushButton("✎")
-        btn_edit_theme.setFixedWidth(30)
-        btn_edit_theme.setToolTip("테마 편집")
-        btn_edit_theme.clicked.connect(self._edit_theme)
-        theme_btn_layout.addWidget(btn_edit_theme)
-
-        btn_delete_theme = QPushButton("−")
-        btn_delete_theme.setFixedWidth(30)
-        btn_delete_theme.setToolTip("테마 삭제")
-        btn_delete_theme.clicked.connect(self._delete_theme)
-        theme_btn_layout.addWidget(btn_delete_theme)
-
-        theme_btn_layout.addStretch()
-        theme_layout.addLayout(theme_btn_layout)
-
-        top_layout.addWidget(theme_group)
-
-        # 상태 표시
-        self.status_label = QLabel("PDF를 열어주세요")
-        top_layout.addWidget(self.status_label)
+        right_layout.addWidget(self.theme_list)
 
         # 더미 콤보박스들 (내부 로직용 - 숨김)
         self.type_combo = QComboBox()
@@ -1271,14 +1434,29 @@ class PDFLabeler(QMainWindow):
         self.link_combo = QComboBox()
         self.link_combo.hide()
 
-        # 전체 박스 목록 (테마 아래)
-        box_list_widget = QWidget()
-        box_list_layout = QVBoxLayout(box_list_widget)
-        box_list_layout.setContentsMargins(5, 5, 5, 5)
+        # 숨김 상태 라벨 (내부용)
+        self.status_label = QLabel("")
+        self.status_label.hide()
+        self.page_label = QLabel("")
+        self.page_label.hide()
 
-        box_list_label = QLabel("전체 박스 목록")
-        box_list_label.setStyleSheet("font-weight: bold; padding: 3px;")
-        box_list_layout.addWidget(box_list_label)
+        # 전체 박스 목록 헤더 (레이블 + 해설 입력 체크박스 + 전체 접기 버튼)
+        box_list_header = QHBoxLayout()
+        box_list_header.setContentsMargins(0, 0, 0, 0)
+        self.box_list_label = QLabel("전체 박스 목록 (0)")
+        self.box_list_label.setStyleSheet("font-weight: bold; padding: 3px;")
+        box_list_header.addWidget(self.box_list_label)
+        box_list_header.addStretch()
+        from PyQt5.QtWidgets import QCheckBox
+        self.solution_mode_checkbox = QCheckBox("해설 입력")
+        self.solution_mode_checkbox.setChecked(True)
+        self.solution_mode_checkbox.setToolTip("체크 시 새 박스가 해설 타입으로 생성됩니다")
+        box_list_header.addWidget(self.solution_mode_checkbox)
+        self.collapse_all_btn = QPushButton("전체 접기")
+        self.collapse_all_btn.setFixedWidth(70)
+        self.collapse_all_btn.clicked.connect(self._collapse_all_themes)
+        box_list_header.addWidget(self.collapse_all_btn)
+        right_layout.addLayout(box_list_header)
 
         self.box_list = BoxListWidget()
         self.box_list.set_parent_window(self)
@@ -1286,16 +1464,10 @@ class PDFLabeler(QMainWindow):
         self.box_list.theme_selected.connect(self._on_theme_selected_from_popup)
         self.box_list.theme_changed.connect(self._on_theme_changed_by_drag)
         self.box_list.type_changed.connect(self._on_type_changed_by_context)
-        box_list_layout.addWidget(self.box_list)
+        self.box_list.solution_linked.connect(self._on_solution_linked)
+        right_layout.addWidget(self.box_list)
 
-        # 수직 splitter로 테마 영역과 박스 목록 분리
-        right_splitter = QSplitter(Qt.Vertical)
-        right_splitter.addWidget(top_widget)
-        right_splitter.addWidget(box_list_widget)
-        # 50:50 비율 설정
-        right_splitter.setSizes([300, 300])
-
-        control_layout.addWidget(right_splitter)
+        control_layout.addLayout(right_layout)
 
         splitter.addWidget(control_panel)
         splitter.setSizes([100, 800, 300])
@@ -1359,23 +1531,78 @@ class PDFLabeler(QMainWindow):
         return f"theme_{self._theme_counter}"
 
     def _update_theme_list(self):
-        """테마 목록 UI 업데이트"""
+        """테마 목록 UI 업데이트 (이름순 정렬)"""
         self.theme_list.blockSignals(True)  # 시그널 임시 차단
         self.theme_list.clear()
-        for theme in self.themes:
+        # 이름순 정렬 (삭제된 테마는 맨 아래)
+        active_themes = sorted([t for t in self.themes if not t.deleted], key=lambda t: t.name)
+        deleted_themes = sorted([t for t in self.themes if t.deleted], key=lambda t: t.name)
+        sorted_themes = active_themes + deleted_themes
+        for theme in sorted_themes:
             item = QListWidgetItem(theme.name)
-            item.setForeground(QColor(theme.color))
             item.setData(Qt.UserRole, theme.id)
             item.setFlags(item.flags() | Qt.ItemIsEditable)  # 편집 가능
+            if theme.deleted:
+                # 삭제된 테마: 취소선 + 회색
+                font = item.font()
+                font.setStrikeOut(True)
+                item.setFont(font)
+                item.setForeground(QColor("#999999"))
+            # 삭제되지 않은 테마는 기본 색상 (검정)
             self.theme_list.addItem(item)
+
+        # 맨 아래에 항상 빈 입력 항목 추가
+        new_item = QListWidgetItem("")
+        new_item.setFlags(new_item.flags() | Qt.ItemIsEditable)
+        new_item.setData(Qt.UserRole, "__new__")
+        new_item.setForeground(QColor("#aaaaaa"))
+        self.theme_list.addItem(new_item)
+
         self.theme_list.blockSignals(False)
 
     def _update_theme_combo(self):
-        """테마 콤보박스 업데이트"""
+        """테마 콤보박스 업데이트 (삭제되지 않은 테마만)"""
         self.theme_combo.clear()
         self.theme_combo.addItem("(없음)", None)
         for theme in self.themes:
-            self.theme_combo.addItem(f"● {theme.name}", theme.id)
+            if not theme.deleted:
+                self.theme_combo.addItem(f"● {theme.name}", theme.id)
+
+    def _toggle_theme_deleted(self):
+        """선택된 테마 삭제 토글 (삭제 표시/복원)"""
+        current = self.theme_list.currentItem()
+        if not current:
+            QMessageBox.information(self, "안내", "삭제할 테마를 선택해주세요.")
+            return
+
+        theme_id = current.data(Qt.UserRole)
+        theme = self.get_theme_by_id(theme_id)
+        if not theme:
+            return
+
+        if theme.deleted:
+            # 복원
+            theme.deleted = False
+            self.status_label.setText(f"테마 복원: {theme.name}")
+        else:
+            # 삭제 표시 - 해당 테마의 박스들은 미지정으로 변경
+            theme.deleted = True
+            # 이 테마에 속한 박스들의 원래 테마 ID를 저장하고 미지정으로 변경
+            for page_idx, boxes in self.boxes.items():
+                for box in boxes:
+                    if box.theme_id == theme_id:
+                        # 원래 테마 ID 저장 (복원 시 사용)
+                        if not hasattr(box, '_original_theme_id'):
+                            box._original_theme_id = None
+                        box._original_theme_id = theme_id
+                        box.theme_id = None
+            self.status_label.setText(f"테마 삭제: {theme.name} (박스들은 미지정으로 이동)")
+
+        self._update_theme_list()
+        self._update_theme_combo()
+        self._update_box_list()
+        self.canvas.update()
+        self._schedule_auto_save()
 
     def _add_theme(self):
         """테마 추가 - 인라인 편집으로 시작"""
@@ -1447,7 +1674,7 @@ class PDFLabeler(QMainWindow):
         theme_id = item.data(Qt.UserRole)
         new_name = item.text().strip()
 
-        if theme_id:
+        if theme_id and theme_id != "__new__":
             # 기존 테마 이름 수정
             theme = self.get_theme_by_id(theme_id)
             if theme and new_name:
@@ -1460,12 +1687,31 @@ class PDFLabeler(QMainWindow):
                 # 빈 이름이면 원래 이름으로 복원
                 self._update_theme_list()
         else:
-            # 새 테마 추가 완료
+            # 새 테마 추가 완료 (theme_id가 None 또는 "__new__")
             if new_name:
+                # 중복 체크
+                for theme in self.themes:
+                    if theme.name == new_name and not theme.deleted:
+                        self.status_label.setText(f"이미 존재하는 테마: {new_name}")
+                        self._update_theme_list()
+                        return
+                # 삭제된 동일 이름 테마가 있으면 복원
+                for theme in self.themes:
+                    if theme.name == new_name and theme.deleted:
+                        theme.deleted = False
+                        self._update_theme_list()
+                        self._update_theme_combo()
+                        self._update_box_list()
+                        self.status_label.setText(f"테마 복원: {new_name}")
+                        self._schedule_auto_save()
+                        return
+                # 새 테마 생성
+                colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22", "#34495e"]
+                color = colors[len(self.themes) % len(colors)]
                 theme = Theme(
                     id=self._generate_theme_id(),
                     name=new_name,
-                    color="#3498db"
+                    color=color
                 )
                 self.themes.append(theme)
                 self._update_theme_list()
@@ -1552,6 +1798,7 @@ class PDFLabeler(QMainWindow):
         if not box_items:
             return
 
+        self._save_state_for_undo()  # Undo용 상태 저장
         updated_pages = set()
         count = 0
 
@@ -1562,6 +1809,11 @@ class PDFLabeler(QMainWindow):
                 count += 1
 
         if count > 0:
+            # 테마 변경 후 정렬 다시 수행
+            self._sorted_boxes.sort(key=lambda x: self._get_box_sort_key(x[0], x[1]))
+            # 변경된 테마 펼침 상태로 만들기
+            if theme_id:
+                self.box_list._collapsed_themes.discard(theme_id)
             self._update_box_list()
             for page_idx in updated_pages:
                 self._update_thumbnail_boxes(page_idx)
@@ -1580,6 +1832,7 @@ class PDFLabeler(QMainWindow):
         if not box_items:
             return
 
+        self._save_state_for_undo()  # Undo용 상태 저장
         updated_pages = set()
         count = 0
 
@@ -1601,6 +1854,68 @@ class PDFLabeler(QMainWindow):
 
             type_name = "문제" if box_type == BOX_TYPE_QUESTION else "해설"
             self.status_label.setText(f"{count}개 박스 타입 변경: {type_name}")
+
+    def _on_solution_linked(self, solution_items: list, question_box_id: str):
+        """해설을 문제에 드래그&드롭으로 연결"""
+        if not solution_items or not question_box_id:
+            return
+
+        self._save_state_for_undo()  # Undo용 상태 저장
+        count = 0
+        for page_idx, solution_box in solution_items:
+            if solution_box.box_type == BOX_TYPE_SOLUTION:
+                solution_box.linked_box_id = question_box_id
+                count += 1
+
+        if count > 0:
+            self._update_box_list()
+            self.canvas.update()
+            self._schedule_auto_save()
+            self.status_label.setText(f"{count}개 해설이 문제에 연결됨")
+
+    # ===== Undo 기능 =====
+    def _save_state_for_undo(self):
+        """현재 상태를 Undo용으로 저장"""
+        import copy
+        # 박스 상태 깊은 복사
+        boxes_copy = {}
+        for page_idx, boxes in self.boxes.items():
+            boxes_copy[page_idx] = [
+                QuestionBox(
+                    x1=b.x1, y1=b.y1, x2=b.x2, y2=b.y2,
+                    number=b.number, theme_id=b.theme_id, page=b.page,
+                    box_type=b.box_type, linked_box_id=b.linked_box_id, box_id=b.box_id
+                ) for b in boxes
+            ]
+        self._undo_state = {
+            'boxes': boxes_copy,
+            'box_counter': self._box_counter
+        }
+
+    def _undo(self):
+        """마지막 작업 되돌리기"""
+        if self._undo_state is None:
+            self.status_label.setText("되돌릴 작업이 없습니다")
+            return
+
+        # 상태 복원
+        self.boxes = self._undo_state['boxes']
+        self._box_counter = self._undo_state['box_counter']
+        self._undo_state = None
+
+        # 정렬 목록 재구성
+        self._sorted_boxes = []
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                self._sorted_boxes.append((page_idx, box))
+        self._sorted_boxes.sort(key=lambda x: self._get_box_sort_key(x[0], x[1]))
+
+        # UI 갱신
+        self._update_box_list()
+        self.canvas.update()
+        self._refresh_all_thumbnails()
+        self._schedule_auto_save()
+        self.status_label.setText("작업이 되돌려졌습니다")
 
     # ===== 박스 유형 및 연결 관리 =====
     def _generate_box_id(self) -> str:
@@ -1750,6 +2065,7 @@ class PDFLabeler(QMainWindow):
 
     def delete_box_on_canvas(self, box_idx: int):
         """캔버스에서 박스 삭제 (오른쪽 클릭)"""
+        self._save_state_for_undo()  # Undo용 상태 저장
         boxes = self.get_current_boxes()
         if 0 <= box_idx < len(boxes):
             box = boxes[box_idx]
@@ -1769,15 +2085,21 @@ class PDFLabeler(QMainWindow):
 
     def add_box(self, start: QPoint, end: QPoint):
         """박스 추가"""
+        self._save_state_for_undo()  # Undo용 상태 저장
         x1 = int(min(start.x(), end.x()) / self.scale)
         y1 = int(min(start.y(), end.y()) / self.scale)
         x2 = int(max(start.x(), end.x()) / self.scale)
         y2 = int(max(start.y(), end.y()) / self.scale)
 
+        # 해설 입력 모드 체크 시 해설 타입으로 생성
+        box_type = BOX_TYPE_SOLUTION if self.solution_mode_checkbox.isChecked() else BOX_TYPE_QUESTION
+
         box = QuestionBox(
             x1=x1, y1=y1, x2=x2, y2=y2,
             page=self.current_page_idx + 1,
-            box_id=self._generate_box_id()
+            box_id=self._generate_box_id(),
+            theme_id=self._current_theme_id,  # 현재 테마 자동 적용
+            box_type=box_type
         )
 
         if self.current_page_idx not in self.boxes:
@@ -1789,6 +2111,10 @@ class PDFLabeler(QMainWindow):
         # 정렬 목록에 추가하고 재정렬
         self._sorted_boxes.append((self.current_page_idx, box))
         self._sorted_boxes.sort(key=lambda x: self._get_box_sort_key(x[0], x[1]))
+
+        # 현재 테마가 있으면 펼침 상태로 만들기
+        if self._current_theme_id:
+            self.box_list._collapsed_themes.discard(self._current_theme_id)
 
         self._update_box_list()
         self._update_thumbnail_boxes(self.current_page_idx)  # 썸네일 업데이트
@@ -1837,8 +2163,8 @@ class PDFLabeler(QMainWindow):
             else:
                 self.sidebar_show_btn.show()
 
-            # 썸네일 생성
-            self._create_thumbnails()
+            # 썸네일 생성 (패널이 표시된 후 폭을 정확히 가져오기 위해 약간 지연)
+            QTimer.singleShot(100, self._create_thumbnails)
 
             # 교재 이름 표시
             self.textbook_label.setText(f"📚 {self.pdf_path.stem}")
@@ -1848,6 +2174,10 @@ class PDFLabeler(QMainWindow):
                 pass  # 이미 status_label 업데이트됨
             else:
                 self.status_label.setText(f"로드 완료: {self.pdf_path.name}")
+
+            # 모든 테마를 접힌 상태로 초기화 (삭제된 테마 제외)
+            self.box_list._collapsed_themes = set(t.id for t in self.themes if not t.deleted)
+            self.box_list._collapsed_themes.add("__none__")  # 미지정 테마도 접기
 
             # 기본 보기: 화면 폭에 맞춤
             self._fit_to_window()
@@ -1859,8 +2189,32 @@ class PDFLabeler(QMainWindow):
             QMessageBox.critical(self, "오류", f"PDF 로드 실패: {e}")
             self.status_label.setText("PDF 로드 실패")
 
+    def _on_splitter_moved(self, pos, index):
+        """스플리터 크기 변경 시 디바운싱으로 썸네일 재렌더링 예약"""
+        if not hasattr(self, 'pages') or not self.pages:
+            return
+
+        # 1초 후 재렌더링 예약 (기존 타이머 취소 후 재시작)
+        self._thumbnail_resize_timer.stop()
+        self._thumbnail_resize_timer.start(1000)  # 1초
+
+    def _delayed_thumbnail_resize(self):
+        """디바운싱된 썸네일 재렌더링"""
+        if not hasattr(self, 'pages') or not self.pages:
+            return
+
+        panel_width = self.thumbnail_panel.width()
+
+        # 폭이 크게 변했을 때만 재렌더링
+        if abs(panel_width - self._last_thumbnail_width) > 20:
+            self._create_thumbnails()
+            # 현재 작업 중인 페이지 박스도 다시 표시
+            self._update_thumbnail_boxes()
+            # 레이아웃 완료 후 현재 페이지로 스크롤 동기화 (지연 필요)
+            QTimer.singleShot(50, self._update_thumbnail_highlight)
+
     def _create_thumbnails(self):
-        """페이지 썸네일 생성"""
+        """페이지 썸네일 생성 - 패널 폭에 맞춰 동적 렌더링"""
         # 기존 썸네일 제거
         while self.thumbnail_list_layout.count():
             item = self.thumbnail_list_layout.takeAt(0)
@@ -1870,9 +2224,13 @@ class PDFLabeler(QMainWindow):
         self.thumbnail_buttons = []
         self.thumbnail_base_pixmaps = []  # 원본 썸네일 저장
 
+        # 패널 폭에 맞춰 썸네일 크기 계산 (여백 고려)
+        panel_width = self.thumbnail_panel.width()
+        thumb_width = max(60, panel_width - 30)  # 최소 60px, 여백 30px
+        self._last_thumbnail_width = panel_width
+
         for idx, page in enumerate(self.pages):
-            # 썸네일 크기 (폭 80px 기준)
-            thumb_width = 80
+            # 썸네일 크기 (패널 폭 기준)
             aspect_ratio = page.height / page.width
             thumb_height = int(thumb_width * aspect_ratio)
 
@@ -1899,8 +2257,8 @@ class PDFLabeler(QMainWindow):
             self.thumbnail_list_layout.addWidget(btn)
             self.thumbnail_buttons.append(btn)
 
-        # 현재 페이지 강조
-        self._update_thumbnail_highlight()
+        # 현재 페이지 강조 (레이아웃 완료 후 스크롤을 위해 지연)
+        QTimer.singleShot(50, self._update_thumbnail_highlight)
 
     def _update_thumbnail_boxes(self, page_idx: Optional[int] = None):
         """썸네일에 박스 표시 업데이트"""
@@ -1923,6 +2281,7 @@ class PDFLabeler(QMainWindow):
             # 박스가 없으면 원본 사용
             if not boxes:
                 self.thumbnail_buttons[idx].setIcon(QIcon(base_pixmap))
+                self.thumbnail_buttons[idx].setIconSize(base_pixmap.size())
                 continue
 
             # 박스가 있으면 복사본에 그리기
@@ -1935,12 +2294,7 @@ class PDFLabeler(QMainWindow):
 
             for box in boxes:
                 # 테마 색상
-                if box.theme_id:
-                    theme = self.get_theme_by_id(box.theme_id)
-                    color = QColor(theme.color) if theme else QColor(0, 0, 255)
-                else:
-                    color = QColor(0, 0, 255)
-
+                color = QColor(0, 0, 255)  # 기본: 파랑
                 pen = QPen(color, 1)
                 painter.setPen(pen)
 
@@ -1952,6 +2306,7 @@ class PDFLabeler(QMainWindow):
 
             painter.end()
             self.thumbnail_buttons[idx].setIcon(QIcon(pixmap))
+            self.thumbnail_buttons[idx].setIconSize(pixmap.size())
 
     def _update_thumbnail_highlight(self):
         """현재 페이지 썸네일 강조 및 스크롤"""
@@ -2023,6 +2378,12 @@ class PDFLabeler(QMainWindow):
         # 위치 기준으로 정렬
         self._sorted_boxes = sorted(all_boxes, key=lambda x: self._get_box_sort_key(x[0], x[1]))
 
+    def _collapse_all_themes(self):
+        """모든 테마를 접힌 상태로 만들기"""
+        self.box_list._collapsed_themes = set(t.id for t in self.themes if not t.deleted)
+        self.box_list._collapsed_themes.add("__none__")  # 미지정 테마도 접기
+        self._update_box_list()
+
     def _update_box_list(self):
         """전체 박스 목록 업데이트 (테마별 그룹화)"""
         # 선택된 박스들 저장 (box 객체로 저장)
@@ -2039,6 +2400,9 @@ class PDFLabeler(QMainWindow):
 
         # 정렬된 목록이 없거나 박스 수가 다르면 재구성
         total_boxes = sum(len(boxes) for boxes in self.boxes.values())
+
+        # 박스 목록 라벨 업데이트
+        self.box_list_label.setText(f"전체 박스 목록 ({total_boxes})")
         if len(self._sorted_boxes) != total_boxes:
             self._rebuild_sorted_boxes()
 
@@ -2057,9 +2421,10 @@ class PDFLabeler(QMainWindow):
                 page_box_counts[page_idx] = 0
             page_box_counts[page_idx] += 1
 
-        # 테마 순서대로 표시 (등록된 테마 순서 → 미지정)
+        # 테마 순서대로 표시 (이름순 정렬 → 미지정, 삭제된 테마 제외)
         # 빈 테마도 표시하기 위해 모든 테마를 순회
-        theme_order = [t.id for t in self.themes] + [None]
+        sorted_themes = sorted([t for t in self.themes if not t.deleted], key=lambda t: t.name)
+        theme_order = [t.id for t in sorted_themes] + [None]
 
         # 접힌 테마 정보 가져오기
         collapsed_themes = self.box_list._collapsed_themes
@@ -2077,24 +2442,25 @@ class PDFLabeler(QMainWindow):
             is_collapsed = collapse_key in collapsed_themes
             arrow = "▶" if is_collapsed else "▼"
 
+            # 현재 선택된 테마인지 확인
+            is_current_theme = (theme_id == self._current_theme_id)
+
             # 테마 헤더 추가
+            marker = "★ " if is_current_theme else ""
             if theme:
-                header_text = f"{arrow} {theme.name} ({len(boxes_in_theme)})"
-                header_item = QListWidgetItem(header_text)
-                header_item.setForeground(QColor(theme.color))
-                header_item.setBackground(QColor(theme.color).lighter(180))
-                header_item.setFlags(header_item.flags() & ~Qt.ItemIsSelectable)  # 선택 불가
-                font = header_item.font()
-                font.setBold(True)
-                header_item.setFont(font)
+                header_text = f"{arrow} {marker}{theme.name} ({len(boxes_in_theme)})"
             else:
-                header_text = f"{arrow} (미지정) ({len(boxes_in_theme)})"
-                header_item = QListWidgetItem(header_text)
-                header_item.setForeground(QColor("#888888"))
-                header_item.setFlags(header_item.flags() & ~Qt.ItemIsSelectable)
-                font = header_item.font()
-                font.setBold(True)
-                header_item.setFont(font)
+                header_text = f"{arrow} {marker}(미지정) ({len(boxes_in_theme)})"
+            header_item = QListWidgetItem(header_text)
+            # 현재 테마면 배경색 강조
+            if is_current_theme:
+                header_item.setBackground(QColor("#d0e8ff"))
+            font = header_item.font()
+            font.setBold(True)
+            header_item.setFont(font)
+
+            # 테마 ID 저장 (클릭 시 사용)
+            header_item.setData(Qt.UserRole, theme_id)
 
             self.box_list.addItem(header_item)
             self._box_index_map.append(None)  # 헤더는 None
@@ -2103,35 +2469,33 @@ class PDFLabeler(QMainWindow):
             if is_collapsed:
                 continue
 
-            # 해당 테마의 박스들 추가
-            # 페이지 내 순번 재계산 (테마 내에서)
-            theme_page_counts: Dict[int, int] = {}
-            for page_idx, box in boxes_in_theme:
-                if page_idx not in theme_page_counts:
-                    theme_page_counts[page_idx] = 0
-                theme_page_counts[page_idx] += 1
-                box_num_in_page = theme_page_counts[page_idx]
+            # 해당 테마의 박스들을 문제/해설로 분류
+            display_theme = theme.name if theme else "미지정"
+            questions = [(p, b) for p, b in boxes_in_theme if b.box_type == BOX_TYPE_QUESTION]
+            solutions = [(p, b) for p, b in boxes_in_theme if b.box_type == BOX_TYPE_SOLUTION]
 
-                # 유형 아이콘
-                type_icon = "📝" if box.box_type == BOX_TYPE_QUESTION else "📖"
+            # 문제에 연결된 해설 매핑 생성
+            linked_solutions: Dict[str, List[tuple]] = {}  # question_box_id -> [(page_idx, solution_box), ...]
+            unlinked_solutions = []
+            for p, s in solutions:
+                if s.linked_box_id:
+                    if s.linked_box_id not in linked_solutions:
+                        linked_solutions[s.linked_box_id] = []
+                    linked_solutions[s.linked_box_id].append((p, s))
+                else:
+                    unlinked_solutions.append((p, s))
 
-                # 형식: 📝 05-01 (5페이지의 1번째 박스)
-                label = f"    {type_icon} {page_idx + 1:02d}-{box_num_in_page:02d}"
+            # 문제를 순서대로 표시하고, 각 문제 아래에 연결된 해설 표시
+            question_index = 0
+            for page_idx, box in questions:
+                question_index += 1
+
+                # 문제 표시
+                label = f"    📝 {display_theme}-{question_index:02d}"
                 if box.number:
                     label += f" #{box.number}"
 
-                # 풀이인 경우 연결된 문제 표시
-                if box.box_type == BOX_TYPE_SOLUTION and box.linked_box_id:
-                    linked_box = self.get_box_by_id(box.linked_box_id)
-                    if linked_box:
-                        link_label = f"→#{linked_box.number}" if linked_box.number else "→문제"
-                        label += f" {link_label}"
-
                 item = QListWidgetItem(label)
-                if theme:
-                    item.setForeground(QColor(theme.color))
-
-                # 현재 페이지 박스는 볼드체
                 if page_idx == self.current_page_idx:
                     font = item.font()
                     font.setBold(True)
@@ -2139,20 +2503,68 @@ class PDFLabeler(QMainWindow):
 
                 self.box_list.addItem(item)
                 self._box_index_map.append((page_idx, box))
+                if id(box) in selected_boxes:
+                    item.setSelected(True)
 
-                # 선택 상태 복원
+                # 이 문제에 연결된 해설들 표시 (들여쓰기)
+                if box.box_id in linked_solutions:
+                    sol_index = 0
+                    for sol_page_idx, sol_box in linked_solutions[box.box_id]:
+                        sol_index += 1
+                        # 테마명-문제순번-해설순번 해설 형식
+                        sol_label = f"        └ 📖 {display_theme}-{question_index:02d}-{sol_index:02d} 해설"
+
+                        sol_item = QListWidgetItem(sol_label)
+                        sol_item.setForeground(QColor("#666666"))
+                        if sol_page_idx == self.current_page_idx:
+                            font = sol_item.font()
+                            font.setBold(True)
+                            sol_item.setFont(font)
+
+                        self.box_list.addItem(sol_item)
+                        self._box_index_map.append((sol_page_idx, sol_box))
+                        if id(sol_box) in selected_boxes:
+                            sol_item.setSelected(True)
+
+            # 미연결 해설 표시 (테마명-순번 해설 형식)
+            solution_index = 0
+            for page_idx, box in unlinked_solutions:
+                solution_index += 1
+                label = f"    📖 {display_theme}-{solution_index:02d} 해설 (미연결)"
+
+                item = QListWidgetItem(label)
+                item.setForeground(QColor("#cc6600"))  # 주황색으로 미연결 표시
+                if page_idx == self.current_page_idx:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+
+                self.box_list.addItem(item)
+                self._box_index_map.append((page_idx, box))
                 if id(box) in selected_boxes:
                     item.setSelected(True)
 
     def _on_box_select(self, item):
-        """박스 선택 - 해당 페이지로 이동"""
+        """박스 선택 - 해당 페이지로 이동 또는 테마 헤더 클릭 시 현재 테마 설정"""
+        # Shift/Ctrl 키가 눌린 상태면 멀티 선택 중이므로 페이지 이동 등 추가 동작 안함
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & (Qt.ShiftModifier | Qt.ControlModifier):
+            return
+
         list_idx = self.box_list.row(item)
         if list_idx < 0 or list_idx >= len(self._box_index_map):
             return
 
-        # 헤더 클릭 시 무시
+        # 헤더 클릭 시 해당 테마를 현재 테마로 설정
         map_entry = self._box_index_map[list_idx]
         if map_entry is None:
+            # 헤더에서 테마 ID 추출
+            theme_id = item.data(Qt.UserRole)
+            self._current_theme_id = theme_id
+            # UI에 현재 테마 표시
+            self._update_current_theme_display()
+            # 박스 목록 갱신 (선택된 테마 강조 업데이트)
+            self._update_box_list()
             return
 
         page_idx, box = map_entry
@@ -2209,6 +2621,17 @@ class PDFLabeler(QMainWindow):
         # 목록에서 현재 선택 항목 다시 선택 (페이지 이동 후에도 유지)
         self.box_list.setCurrentRow(list_idx)
 
+    def _update_current_theme_display(self):
+        """현재 테마 표시 업데이트"""
+        if self._current_theme_id:
+            theme = self.get_theme_by_id(self._current_theme_id)
+            theme_name = theme.name if theme else "미지정"
+        else:
+            theme_name = "미지정"
+
+        book_name = self.pdf_path.stem if self.pdf_path else "(없음)"
+        self.textbook_label.setText(f"📚 {book_name}\n🏷️ 현재 테마: {theme_name}")
+
     def _apply_label(self):
         """레이블 적용"""
         if self.current_box_id is None:
@@ -2251,6 +2674,8 @@ class PDFLabeler(QMainWindow):
         map_entry = self._box_index_map[list_idx]
         if map_entry is None:  # 헤더 클릭 시 무시
             return
+
+        self._save_state_for_undo()  # Undo용 상태 저장
 
         page_idx, box = map_entry
 
@@ -2422,18 +2847,28 @@ class PDFLabeler(QMainWindow):
             QMessageBox.critical(self, "오류", f"불러오기 실패: {e}")
 
     def _export_images(self):
-        """박스 영역 이미지 내보내기"""
+        """박스 영역 이미지 내보내기
+
+        - 교재별 폴더 생성 (PDF 파일명 기준)
+        - 파일명: 테마명-순번.png (테마 내 순차 번호)
+        - 300 DPI, PNG 무손실 형식
+        """
         if not self.pdf_path:
             QMessageBox.warning(self, "경고", "PDF 파일이 열려있지 않습니다.")
             return
 
-        output_dir = QFileDialog.getExistingDirectory(self, "이미지 저장 폴더 선택")
+        # PDF 파일이 있는 폴더를 기본 위치로 설정
+        default_dir = str(self.pdf_path.parent) if self.pdf_path else ""
+        output_dir = QFileDialog.getExistingDirectory(self, "이미지 저장 폴더 선택", default_dir)
         if not output_dir:
             return
 
         output_path = Path(output_dir)
-        images_dir = output_path / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
+
+        # 교재명 폴더 생성 (PDF 파일명에서 확장자 제거)
+        book_name = self.pdf_path.stem
+        book_dir = output_path / book_name
+        book_dir.mkdir(parents=True, exist_ok=True)
 
         self.status_label.setText("고해상도 이미지 생성 중...")
         QApplication.processEvents()
@@ -2442,53 +2877,96 @@ class PDFLabeler(QMainWindow):
         scale_factor = 300 / 150
 
         exported = []
-        idx = 0
+
+        # 테마별 박스를 페이지 순서대로 수집
+        theme_boxes: Dict[str, List[Tuple[int, 'BoundingBox']]] = {}
+        for page_idx, boxes in self.boxes.items():
+            for box in boxes:
+                theme_name = "미분류"
+                if box.theme_id:
+                    theme = self.get_theme_by_id(box.theme_id)
+                    if theme:
+                        theme_name = theme.name
+                if theme_name not in theme_boxes:
+                    theme_boxes[theme_name] = []
+                theme_boxes[theme_name].append((page_idx, box))
+
+        # 각 테마 내에서 페이지 순서로 정렬
+        for theme_name in theme_boxes:
+            theme_boxes[theme_name].sort(key=lambda x: (x[0], x[1].y1, x[1].x1))
+
+        # 테마별 순차 인덱스
+        theme_counter: Dict[str, int] = {}
 
         for page_idx, boxes in self.boxes.items():
             if page_idx >= len(hires_pages):
                 continue
 
             page = hires_pages[page_idx]
+            page_num = page_idx + 1  # 1-based 페이지 번호
 
             for box in boxes:
-                idx += 1
                 x1 = int(box.x1 * scale_factor)
                 y1 = int(box.y1 * scale_factor)
                 x2 = int(box.x2 * scale_factor)
                 y2 = int(box.y2 * scale_factor)
 
                 cropped = page.crop((x1, y1, x2, y2))
-                filename = f"q{idx:03d}.png"
-                cropped.save(images_dir / filename, "PNG")
 
-                # 테마 정보
+                # 테마명 가져오기 (없으면 "미분류")
+                theme_name = "미분류"
                 theme_info = None
                 if box.theme_id:
                     theme = self.get_theme_by_id(box.theme_id)
                     if theme:
+                        theme_name = theme.name
                         theme_info = {"id": theme.id, "name": theme.name}
 
+                # 테마 내 순차 인덱스 계산 (페이지 상관없이)
+                if theme_name not in theme_counter:
+                    theme_counter[theme_name] = 0
+                theme_counter[theme_name] += 1
+                box_index = theme_counter[theme_name]
+
+                # 파일명: 테마명-순번.png (페이지 번호 제거)
+                filename = f"{theme_name}-{box_index:02d}.png"
+
+                # PNG 무손실 저장 (300 DPI 메타데이터 포함)
+                cropped.save(
+                    book_dir / filename,
+                    "PNG",
+                    dpi=(300, 300)
+                )
+
                 exported.append({
-                    "id": f"q{idx:03d}",
-                    "number": box.number,
+                    "filename": filename,
                     "theme": theme_info,
-                    "image_path": f"images/{filename}",
-                    "source_page": page_idx + 1,
-                    "bbox": {"x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2}
+                    "page": page_num,
+                    "index": box_index,
+                    "bbox": {"x1": box.x1, "y1": box.y1, "x2": box.x2, "y2": box.y2},
+                    "box_type": box.box_type
                 })
 
         metadata = {
             "source_pdf": self.pdf_path.name,
+            "book_name": book_name,
             "exported_at": datetime.now().isoformat(),
-            "total_questions": len(exported),
-            "questions": exported
+            "total_images": len(exported),
+            "dpi": 300,
+            "format": "PNG (lossless)",
+            "images": exported
         }
 
-        with open(output_path / "metadata.json", 'w', encoding='utf-8') as f:
+        with open(book_dir / "metadata.json", 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
 
         self.status_label.setText(f"내보내기 완료: {len(exported)}개")
-        QMessageBox.information(self, "완료", f"{len(exported)}개 이미지가 내보내기 되었습니다.\n{output_path}")
+        QMessageBox.information(
+            self, "완료",
+            f"{len(exported)}개 이미지가 내보내기 되었습니다.\n\n"
+            f"폴더: {book_dir}\n"
+            f"형식: PNG 300 DPI (무손실)"
+        )
 
 
 def main():
