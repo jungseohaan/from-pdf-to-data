@@ -31,6 +31,27 @@ sudo apt-get install tesseract-ocr poppler-utils
 pip install -r requirements.txt
 ```
 
+### Google OAuth 설정 (AI 분석 기능용)
+
+AI 문항 분석 기능을 사용하려면 Google OAuth 인증이 필요합니다.
+
+1. [Google Cloud Console](https://console.cloud.google.com/)에서 프로젝트 생성
+2. OAuth 2.0 클라이언트 ID 생성 (데스크톱 앱)
+3. 인증 정보 다운로드 후 설정:
+
+```bash
+# 템플릿 복사
+cp config/credentials.example.json config/credentials.json
+
+# credentials.json 편집하여 실제 값 입력
+```
+
+4. `.env` 파일에 Gemini API 키 추가:
+
+```bash
+GEMINI_API_KEY=your-gemini-api-key
+```
+
 ## 사용법
 
 ### CLI (배치 처리)
