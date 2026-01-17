@@ -1,11 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
 block_cipher = None
+
+# Poppler 바이너리 경로
+poppler_bin = '/opt/homebrew/bin'
+poppler_binaries = [
+    (os.path.join(poppler_bin, 'pdftoppm'), '.'),
+    (os.path.join(poppler_bin, 'pdfinfo'), '.'),
+]
+
+# Poppler 라이브러리 경로
+poppler_lib = '/opt/homebrew/lib'
+poppler_libs = []
+for lib in os.listdir(poppler_lib):
+    if lib.startswith('libpoppler') and '.dylib' in lib:
+        poppler_libs.append((os.path.join(poppler_lib, lib), '.'))
 
 a = Analysis(
     ['src/labeler.py'],
     pathex=[],
-    binaries=[],
+    binaries=poppler_binaries + poppler_libs,
     datas=[],
     hiddenimports=[
         'PIL',

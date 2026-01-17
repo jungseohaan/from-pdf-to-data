@@ -30,3 +30,7 @@ input/
 
 # Logs
 *.log
+
+# Credentials (OAuth tokens, API keys)
+config/token.json
+config/credentials.json
