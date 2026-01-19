@@ -18,25 +18,499 @@
           "text": "보기 내용"
         }
       ],
-      "graphs": [
+      "figures": [
         {
-          "description": "그래프/그림 설명",
-          "bbox": {
-            "x1": 0.0,
-            "y1": 0.0,
-            "x2": 1.0,
-            "y2": 1.0
+          "figure_type": "function_graph|geometry|number_line|vector_diagram|table|other",
+          "bbox_percent": {
+            "x1": 0.1,
+            "y1": 0.3,
+            "x2": 0.9,
+            "y2": 0.7
+          },
+          "tikz_code": "\\begin{tikzpicture}[scale=0.8]\n  \\draw[->] (-1,0) -- (5,0) node[right] {$x$};\n  \\draw[->] (0,-1) -- (0,5) node[above] {$y$};\n  \\draw[thick,blue,domain=-0.5:4.5] plot (\\x, {-(\\x-2)^2+4});\n  \\fill (2,4) circle (2pt) node[above] {P};\n  \\fill (0,0) circle (2pt) node[below left] {O};\n  \\fill (4,0) circle (2pt) node[below] {A};\n\\end{tikzpicture}",
+          "coordinate_system": {
+            "type": "cartesian|polar|none",
+            "origin": [
+              0,
+              0
+            ],
+            "x_range": [
+              -1,
+              5
+            ],
+            "y_range": [
+              -1,
+              5
+            ],
+            "x_label": "x",
+            "y_label": "y",
+            "x_tick_interval": 1,
+            "y_tick_interval": 1,
+            "grid": "none|major|minor",
+            "axis_style": "arrows|lines|L-shape"
+          },
+          "curves": [
+            {
+              "id": "curve1",
+              "type": "function|parametric|implicit|piecewise|arc",
+              "equation": "y = -(x-2)^2 + 4",
+              "latex": "$y = -(x-2)^2 + 4$",
+              "parametric_form": {
+                "x": "t",
+                "y": "t^2",
+                "t_range": [
+                  0,
+                  2
+                ]
+              },
+              "implicit_form": "x^2 + y^2 = 1",
+              "piecewise": [
+                {
+                  "condition": "x < 0",
+                  "equation": "y = -x"
+                },
+                {
+                  "condition": "x >= 0",
+                  "equation": "y = x^2"
+                }
+              ],
+              "domain": [
+                -0.5,
+                4.5
+              ],
+              "range": [
+                -1,
+                4
+              ],
+              "asymptotes": {
+                "vertical": [
+                  0
+                ],
+                "horizontal": [
+                  1
+                ],
+                "oblique": "y = x"
+              },
+              "critical_points": [
+                {
+                  "x": 2,
+                  "y": 4,
+                  "type": "maximum"
+                },
+                {
+                  "x": 0,
+                  "y": 0,
+                  "type": "zero"
+                },
+                {
+                  "x": 4,
+                  "y": 0,
+                  "type": "zero"
+                }
+              ],
+              "inflection_points": [],
+              "concavity": "down",
+              "style": "solid",
+              "color": "black",
+              "thickness": "normal",
+              "arrow_at_end": false
+            }
+          ],
+          "points": [
+            {
+              "id": "P1",
+              "coords": [
+                2,
+                4
+              ],
+              "exact_coords": [
+                "2",
+                "4"
+              ],
+              "label": "P",
+              "label_position": "above",
+              "label_offset": [
+                0,
+                0.3
+              ],
+              "style": "filled",
+              "size": "normal",
+              "color": "black"
+            }
+          ],
+          "lines": [
+            {
+              "id": "line1",
+              "type": "segment",
+              "from": [
+                0,
+                0
+              ],
+              "to": [
+                4,
+                0
+              ],
+              "from_label": "O",
+              "to_label": "A",
+              "equation": "y = 0",
+              "slope": 0,
+              "y_intercept": 0,
+              "label": "",
+              "label_position": "above",
+              "style": "solid",
+              "color": "black",
+              "arrow": "none|start|end|both"
+            }
+          ],
+          "shapes": [
+            {
+              "id": "shape1",
+              "type": "circle|ellipse|triangle|quadrilateral|polygon|arc|sector|angle",
+              "center": [
+                0,
+                0
+              ],
+              "radius": 2,
+              "radii": [
+                3,
+                2
+              ],
+              "vertices": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  3,
+                  0
+                ],
+                [
+                  1.5,
+                  2.6
+                ]
+              ],
+              "vertex_labels": [
+                "A",
+                "B",
+                "C"
+              ],
+              "vertex_label_positions": [
+                "below left",
+                "below right",
+                "above"
+              ],
+              "side_lengths": [
+                3,
+                3,
+                3
+              ],
+              "side_labels": [
+                "a",
+                "b",
+                "c"
+              ],
+              "angles": [
+                60,
+                60,
+                60
+              ],
+              "angle_labels": [
+                "α",
+                "β",
+                "γ"
+              ],
+              "start_angle": 0,
+              "end_angle": 90,
+              "fill": "none",
+              "fill_color": "lightgray",
+              "fill_opacity": 0.3,
+              "edge_style": "solid",
+              "edge_color": "black"
+            }
+          ],
+          "vectors": [
+            {
+              "id": "vec1",
+              "from": [
+                0,
+                0
+              ],
+              "to": [
+                2,
+                3
+              ],
+              "label": "\\vec{a}",
+              "label_position": "above",
+              "color": "blue",
+              "style": "solid"
+            }
+          ],
+          "annotations": [
+            {
+              "text": "최댓값",
+              "position": [
+                2.3,
+                4.3
+              ],
+              "anchor": "south west",
+              "arrow_to": [
+                2,
+                4
+              ],
+              "font_size": "normal",
+              "box": false
+            }
+          ],
+          "shaded_regions": [
+            {
+              "id": "region1",
+              "description": "곡선 y=f(x)와 x축 사이의 영역",
+              "boundary_curves": [
+                "curve1"
+              ],
+              "boundary_lines": [
+                "y=0"
+              ],
+              "x_bounds": [
+                0,
+                4
+              ],
+              "y_bounds": [
+                0,
+                "f(x)"
+              ],
+              "fill_pattern": "solid|diagonal_lines|dots|horizontal_lines|crosshatch",
+              "fill_color": "lightblue",
+              "fill_opacity": 0.5
+            }
+          ],
+          "special_marks": [
+            {
+              "type": "right_angle",
+              "vertex": [
+                0,
+                0
+              ],
+              "ray1_direction": [
+                1,
+                0
+              ],
+              "ray2_direction": [
+                0,
+                1
+              ],
+              "size": 0.3
+            },
+            {
+              "type": "angle_arc",
+              "vertex": [
+                0,
+                0
+              ],
+              "start_angle": 0,
+              "end_angle": 45,
+              "radius": 0.5,
+              "label": "θ"
+            },
+            {
+              "type": "equal_length",
+              "segment": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  2,
+                  0
+                ]
+              ],
+              "tick_count": 1
+            },
+            {
+              "type": "parallel",
+              "line1": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  2,
+                  0
+                ]
+              ],
+              "line2": [
+                [
+                  0,
+                  2
+                ],
+                [
+                  2,
+                  2
+                ]
+              ],
+              "arrow_count": 1
+            }
+          ],
+          "dimensions": [
+            {
+              "type": "length",
+              "from": [
+                0,
+                0
+              ],
+              "to": [
+                4,
+                0
+              ],
+              "label": "4",
+              "offset": -0.5
+            }
+          ],
+          "mathematical_analysis": {
+            "function_type": "quadratic|linear|cubic|exponential|logarithmic|trigonometric|rational|piecewise|other",
+            "explicit_equations": [
+              "y = -(x-2)^2 + 4",
+              "y = -x^2 + 4x"
+            ],
+            "vertex_form": "y = -(x-2)^2 + 4",
+            "standard_form": "y = -x^2 + 4x",
+            "factored_form": "y = -(x)(x-4)",
+            "zeros": [
+              0,
+              4
+            ],
+            "y_intercept": 0,
+            "vertex": [
+              2,
+              4
+            ],
+            "axis_of_symmetry": "x = 2",
+            "domain_of_function": "all real numbers",
+            "range_of_function": "y ≤ 4",
+            "increasing_intervals": [
+              "(-∞, 2)"
+            ],
+            "decreasing_intervals": [
+              "(2, ∞)"
+            ],
+            "key_observations": [
+              "아래로 볼록한 포물선",
+              "꼭짓점 (2, 4)에서 최댓값",
+              "x축과 두 점 (0, 0), (4, 0)에서 만남",
+              "y축이 대칭축이 아님, x=2가 대칭축"
+            ],
+            "geometric_properties": [
+              "삼각형 OPA의 넓이 = 8"
+            ]
           }
         }
       ]
     }
   },
   "rules": [
-    "question_text: 이미지의 모든 텍스트를 빠짐없이 추출. 첫 단어부터 끝까지 완전하게.",
-    "모든 수식은 반드시 LaTeX로 변환: 변수(x, y, n 등), 분수, 지수, 루트, 적분, 극한, 시그마, 행렬, 부등호 등 수학 기호가 포함된 모든 표현은 LaTeX로 작성. 인라인 수식은 $...$로, 독립 수식은 $$...$$로 감싸기. 예: $x^2$, $\\frac{1}{2}$, $\\lim_{n \\to \\infty}$, $\\int_0^1 f(x) dx$",
-    "choices: 선택지 ①②③④⑤가 있으면 배열로 (없으면 빈 배열). 선택지 내 수식도 모두 LaTeX로 변환",
-    "sub_questions: (가)(나) 또는 ㄱㄴㄷ 보기가 있으면 배열로 (없으면 빈 배열). 보기 내 수식도 모두 LaTeX로 변환",
-    "graphs: 중요! 이미지에 좌표평면, 함수 그래프, 도형, 그림이 있으면 반드시 검출하세요. 검출 대상: 좌표축(x, y축), 함수 곡선, 점, 도형(원, 삼각형, 사각형 등), 벡터, 수직선. bbox 좌표는 0~1 사이 상대좌표로 반환. 예: {\"description\": \"함수 y=f(x)의 그래프\", \"bbox\": {\"x1\": 0.1, \"y1\": 0.3, \"x2\": 0.9, \"y2\": 0.8}}. 그래프/그림이 없으면 빈 배열 []",
-    "question_number: 문제 번호가 보이면 숫자로 입력 (예: 1, 15, 30)"
+    "question_text: 이미지의 모든 텍스트를 빠짐없이 추출. <보기> 박스 안의 내용도 반드시 포함!",
+    "모든 수식은 반드시 LaTeX로 변환. 인라인 수식은 $...$로, 독립 수식은 $$...$$로 감싸기. 중괄호는 \\lbrace \\rbrace 사용.",
+    "choices: 선택지 ①②③④⑤가 있으면 배열로 (없으면 빈 배열).",
+    "sub_questions: <보기> 박스 안의 내용을 추출. 없으면 빈 배열 []",
+    "",
+    "================================================================================",
+    "=== 그래프/도형 추출 규칙 (가장 중요 - 반드시 상세하게!) ===",
+    "================================================================================",
+    "",
+    "*** 핵심 원칙: 이 데이터만으로 TikZ/matplotlib 코드를 작성할 수 있어야 함 ***",
+    "*** 모든 숫자는 그래프에서 정확히 읽어서 기록. 추측하지 말 것! ***",
+    "",
+    "1. bbox_percent (필수): 이미지 내 그래프 위치",
+    "   - x1, y1: 좌상단 (0~1), x2, y2: 우하단 (0~1)",
+    "   - 예: {x1: 0.05, y1: 0.4, x2: 0.95, y2: 0.95}",
+    "",
+    "2. tikz_code (필수): 이 그래프를 재현하는 TikZ 코드 작성",
+    "   - 실제 컴파일 가능한 완전한 tikzpicture 환경",
+    "   - 모든 요소 포함: 축, 곡선, 점, 라벨, 음영 등",
+    "   - 정확한 좌표와 방정식 사용",
+    "",
+    "3. coordinate_system (필수): 좌표계 상세 정보",
+    "   - x_range, y_range: 축에 표시된 최소/최대값 정확히 읽기",
+    "   - x_tick_interval, y_tick_interval: 눈금 간격",
+    "   - origin: 원점 위치 (보통 [0,0])",
+    "   - axis_style: 화살표가 있는지, L자형인지",
+    "",
+    "4. curves: 모든 곡선을 상세히 분석",
+    "   필수 정보:",
+    "   - equation: 정확한 함수식 (y = ... 형태)",
+    "   - domain: 그려진 x 범위 [시작, 끝]",
+    "   - critical_points: 극값, 영점, 변곡점 좌표",
+    "   - style: solid(실선)/dashed(파선)/dotted(점선)",
+    "   ",
+    "   함수 유형별 추가 정보:",
+    "   - 포물선: vertex_form, zeros, vertex, axis_of_symmetry",
+    "   - 삼각함수: 주기, 진폭, 위상이동",
+    "   - 지수/로그: 점근선",
+    "   - 분수함수: 수직/수평 점근선",
+    "   - 조각함수: 각 구간별 식과 조건",
+    "",
+    "5. points: 표시된 모든 점을 빠짐없이",
+    "   - coords: [x, y] 좌표를 격자에서 정확히 읽기",
+    "   - label: 점 옆에 쓰인 라벨 (P, A, B, O 등)",
+    "   - label_position: 라벨이 점의 어느 방향에 있는지",
+    "   - style: filled(●속이 찬 점), hollow(○빈 점)",
+    "",
+    "6. lines: 선분, 직선, 반직선",
+    "   - from, to: 양 끝점 좌표",
+    "   - equation: 직선의 방정식 (알 수 있으면)",
+    "   - slope, y_intercept: 기울기와 y절편",
+    "   - style: 실선/파선/점선",
+    "   - arrow: 화살표 유무와 방향",
+    "",
+    "7. shapes: 기하 도형 상세 정보",
+    "   원/타원:",
+    "   - center, radius (또는 radii for 타원)",
+    "   ",
+    "   다각형:",
+    "   - vertices: 모든 꼭짓점 좌표 순서대로",
+    "   - vertex_labels: 각 꼭짓점 라벨",
+    "   - side_lengths: 변의 길이 (표시되어 있으면)",
+    "   - angles: 각의 크기 (표시되어 있으면)",
+    "   ",
+    "   호/부채꼴:",
+    "   - center, radius, start_angle, end_angle",
+    "",
+    "8. vectors: 벡터 화살표",
+    "   - from, to: 시점과 종점",
+    "   - label: 벡터 이름 (\\vec{a} 등)",
+    "",
+    "9. annotations: 그래프에 쓰인 텍스트",
+    "   - text: 내용 (예: '최댓값', 'f(x)', '넓이 S')",
+    "   - position: 텍스트 위치 좌표",
+    "   - arrow_to: 화살표가 가리키는 좌표 (있으면)",
+    "",
+    "10. shaded_regions: 색칠/음영 영역",
+    "    - 정확한 경계 기술: 어떤 곡선들 사이인지",
+    "    - x_bounds, y_bounds: 범위",
+    "    - fill_pattern: 빗금/점/단색 등",
+    "",
+    "11. special_marks: 특수 기호들",
+    "    - right_angle: 직각 표시 위치와 방향",
+    "    - angle_arc: 각도 호 (시작/끝 각도, 라벨)",
+    "    - equal_length: 같은 길이 표시 (틱 개수)",
+    "    - parallel: 평행 표시 (화살표 개수)",
+    "",
+    "12. mathematical_analysis: 수학적 분석 (가장 중요!)",
+    "    - function_type: 함수 종류",
+    "    - explicit_equations: 모든 가능한 형태의 방정식",
+    "    - zeros: x절편들",
+    "    - y_intercept: y절편",
+    "    - vertex: 꼭짓점 (포물선)",
+    "    - asymptotes: 점근선",
+    "    - key_observations: 그래프에서 읽을 수 있는 중요한 정보들",
+    "    - geometric_properties: 기하학적 성질 (넓이, 길이 등)",
+    "",
+    "*** 주의사항 ***",
+    "- 좌표는 반드시 그래프의 격자/눈금에서 읽을 것",
+    "- 불확실하면 '약' 또는 근사값임을 표시",
+    "- 빈 배열보다는 최대한 정보를 채울 것",
+    "- 그림이 없으면 figures: []",
+    "",
+    "question_number: 문제 번호가 보이면 숫자로"
   ]
 }

@@ -34,3 +34,4 @@ input/
 # Credentials (OAuth tokens, API keys)
 config/token.json
 config/credentials.json
+config/settings.json

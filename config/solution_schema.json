@@ -1,0 +1,50 @@
+{
+  "description": "수학 해설 분석 결과 스키마",
+  "schema": {
+    "type": "{box_type}",
+    "theme_name": "{theme_name}",
+    "question_number": "문제 번호 (숫자 또는 null)",
+    "content": {
+      "solution_text": "해설 본문 전체 (수식은 LaTeX로 변환)",
+      "answer": "정답 (숫자, 문자, 수식 등)",
+      "key_concepts": ["핵심 개념 1", "핵심 개념 2"],
+      "figures": [
+        {
+          "figure_type": "function_graph|geometry|number_line|vector_diagram|table|other",
+          "verbal_description": "그래프/도형에 대한 자연어 설명",
+          "mathematical_elements": {
+            "equations": ["y = f(x)", "직선: y = ax + b"],
+            "constraints": ["조건1", "조건2"],
+            "key_points": [
+              {"name": "점 이름", "coords": [0, 0], "significance": "의미"}
+            ],
+            "key_values": [
+              {"name": "값 이름", "value": "값", "of": "대상"}
+            ]
+          },
+          "properties": {
+            "concavity": "up|down|none",
+            "symmetry": "대칭 정보",
+            "domain": "정의역",
+            "range": "치역"
+          },
+          "relationships": ["요소 간 관계"],
+          "labels_in_figure": ["A", "B", "C"]
+        }
+      ]
+    }
+  },
+  "rules": [
+    "solution_text: 해설의 모든 텍스트를 빠짐없이 추출. 풀이 과정 전체를 완전하게 포함.",
+    "모든 수식은 반드시 LaTeX로 변환: 인라인 수식은 $...$로, 독립 수식은 $$...$$로 감싸기. 중괄호는 \\lbrace \\rbrace 사용 (\\{ \\} 대신).",
+    "answer: 최종 정답을 추출. 수식이면 LaTeX로 변환",
+    "key_concepts: 해설에서 사용된 핵심 수학 개념을 배열로 추출. 없으면 빈 배열 []",
+    "figures: 해설에 포함된 그래프/도형을 수학적으로 해석하여 추출",
+    "  - verbal_description: 그림을 자연어로 완전히 설명",
+    "  - equations: 관련 방정식들",
+    "  - constraints: 조건들",
+    "  - key_points: 중요한 점들",
+    "  - 그림이 없으면 빈 배열 []",
+    "question_number: 해설이 어떤 문제 번호의 풀이인지 숫자로"
+  ]
+}

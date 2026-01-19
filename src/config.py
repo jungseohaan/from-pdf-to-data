@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict
 # 설정 파일 경로
 CONFIG_DIR = Path(__file__).parent.parent / "config"
 SCHEMA_FILE = CONFIG_DIR / "output_schema.json"
+SOLUTION_SCHEMA_FILE = CONFIG_DIR / "solution_schema.json"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 
@@ -108,6 +109,61 @@ def load_output_schema() -> dict:
     return DEFAULT_OUTPUT_SCHEMA
 
 
+# 기본 해설 스키마
+DEFAULT_SOLUTION_SCHEMA = {
+    "description": "수학 해설 분석 결과 스키마",
+    "schema": {
+        "type": "{box_type}",
+        "theme_name": "{theme_name}",
+        "question_number": "문제 번호 (숫자 또는 null)",
+        "content": {
+            "solution_text": "해설 본문 전체 (수식은 LaTeX로 변환)",
+            "answer": "정답 (숫자, 문자, 수식 등)",
+            "key_concepts": ["핵심 개념 1", "핵심 개념 2"],
+            "graphs": [
+                {
+                    "description": "그래프/그림 설명",
+                    "bbox": {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0}
+                }
+            ]
+        }
+    },
+    "rules": [
+        "solution_text: 해설의 모든 텍스트를 빠짐없이 추출. 풀이 과정 전체를 완전하게 포함.",
+        "모든 수식은 반드시 LaTeX로 변환: 인라인 수식은 $...$로, 독립 수식은 $$...$$로 감싸기.",
+        "answer: 최종 정답을 추출. 수식이면 LaTeX로 변환",
+        "key_concepts: 해설에서 사용된 핵심 수학 개념을 배열로 추출. 없으면 빈 배열 []",
+        "graphs: 그래프/그림이 있으면 상대 좌표(0~1)로 bbox 반환. 없으면 빈 배열 []",
+        "question_number: 해설이 어떤 문제 번호의 풀이인지 숫자로"
+    ]
+}
+
+
+def load_solution_schema() -> dict:
+    """해설 스키마 로드 (없으면 기본값 생성)"""
+    ensure_config_dir()
+    if SOLUTION_SCHEMA_FILE.exists():
+        try:
+            with open(SOLUTION_SCHEMA_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # 기본 스키마 저장
+    save_solution_schema(DEFAULT_SOLUTION_SCHEMA)
+    return DEFAULT_SOLUTION_SCHEMA
+
+
+def save_solution_schema(schema: dict) -> bool:
+    """해설 스키마 저장"""
+    ensure_config_dir()
+    try:
+        with open(SOLUTION_SCHEMA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(schema, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 def save_output_schema(schema: dict) -> bool:
     """출력 스키마 저장"""
     ensure_config_dir()
@@ -126,6 +182,8 @@ def load_settings() -> dict:
         "selected_model": "gemini-2.0-flash-exp",
         "gemini_api_key": "",
         "openai_api_key": "",
+        "supabase_url": "",
+        "supabase_key": "",
     }
     if SETTINGS_FILE.exists():
         try:
@@ -149,7 +207,20 @@ def save_settings(settings: dict) -> bool:
 
 
 def generate_prompt_from_schema(schema: dict, box_type: str, theme_name: str) -> str:
-    """스키마를 기반으로 프롬프트 생성"""
+    """스키마를 기반으로 프롬프트 생성
+
+    box_type이 "solution" 또는 "해설"이면 해설용 스키마 사용
+    """
+    # 해설 타입인지 확인
+    is_solution = box_type.lower() in ("solution", "해설")
+
+    # 해설이면 해설 스키마 사용
+    if is_solution:
+        schema = load_solution_schema()
+        type_name = "해설"
+    else:
+        type_name = "문제"
+
     schema_json = json.dumps(schema["schema"], ensure_ascii=False, indent=2)
     # 플레이스홀더 치환
     schema_json = schema_json.replace("{box_type}", box_type)
@@ -157,7 +228,23 @@ def generate_prompt_from_schema(schema: dict, box_type: str, theme_name: str) ->
 
     rules_text = "\n".join(f"{i+1}. {rule}" for i, rule in enumerate(schema.get("rules", [])))
 
-    prompt = f"""이 이미지는 수학 시험지의 {box_type}입니다.
+    if is_solution:
+        prompt = f"""이 이미지는 수학 시험지의 해설/풀이입니다.
+이미지에 있는 모든 텍스트를 빠짐없이 정확하게 추출하여 다음 JSON 형식으로 반환해주세요.
+
+중요:
+- 풀이 과정의 첫 글자부터 마지막 글자까지 모든 텍스트를 누락 없이 추출하세요.
+- 해설에는 선택지(①②③④⑤)나 보기((가)(나))가 없습니다.
+- 풀이 과정과 최종 정답을 정확히 추출하세요.
+
+{schema_json}
+
+규칙:
+{rules_text}
+
+JSON만 반환하세요."""
+    else:
+        prompt = f"""이 이미지는 수학 시험지의 {type_name}입니다.
 이미지에 있는 모든 텍스트를 빠짐없이 정확하게 추출하여 다음 JSON 형식으로 반환해주세요.
 
 중요: 이미지의 첫 글자부터 마지막 글자까지 모든 텍스트를 누락 없이 추출하세요.

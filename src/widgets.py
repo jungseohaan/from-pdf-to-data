@@ -129,6 +129,7 @@ class BoxListWidget(QListWidget):
     theme_selected = pyqtSignal(list, object)
     type_changed = pyqtSignal(list, str)
     solution_linked = pyqtSignal(list, str)
+    boxes_deleted = pyqtSignal(list)  # 삭제할 박스 리스트 [(page_idx, box), ...]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -320,6 +321,12 @@ class BoxListWidget(QListWidget):
                     action = link_menu.addAction(label)
                     action.setData(("link", q_box.box_id))
 
+        # 삭제 메뉴
+        menu.addSeparator()
+        count = len(selected_boxes)
+        delete_action = menu.addAction(f"🗑️ 삭제 ({count}개)" if count > 1 else "🗑️ 삭제")
+        delete_action.setData(("delete", selected_boxes))
+
         action = menu.exec_(self.mapToGlobal(pos))
         if action:
             data = action.data()
@@ -337,6 +344,8 @@ class BoxListWidget(QListWidget):
                     self._parent_window.status_label.setText("문제 연결됨")
                 else:
                     self._parent_window.status_label.setText("문제 연결 해제됨")
+            elif isinstance(data, tuple) and data[0] == "delete":
+                self.boxes_deleted.emit(data[1])
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat("application/x-boxlist"):

@@ -109,6 +109,49 @@ class SettingsDialog(QDialog):
         api_layout.addRow("", env_hint)
 
         model_layout.addWidget(api_group)
+
+        # Supabase 설정
+        supabase_group = QGroupBox("Supabase (문제 저장/검색)")
+        supabase_layout = QFormLayout(supabase_group)
+
+        # Supabase URL
+        self.supabase_url_edit = QLineEdit()
+        self.supabase_url_edit.setPlaceholderText("https://xxxxx.supabase.co")
+        supabase_layout.addRow("URL:", self.supabase_url_edit)
+
+        # Supabase API Key
+        supabase_key_layout = QHBoxLayout()
+        self.supabase_key_edit = QLineEdit()
+        self.supabase_key_edit.setEchoMode(QLineEdit.Password)
+        self.supabase_key_edit.setPlaceholderText("Supabase anon/service key")
+        supabase_key_layout.addWidget(self.supabase_key_edit)
+
+        self.supabase_show_btn = QPushButton("표시")
+        self.supabase_show_btn.setCheckable(True)
+        self.supabase_show_btn.clicked.connect(lambda: self._toggle_key_visibility(
+            self.supabase_key_edit, self.supabase_show_btn))
+        supabase_key_layout.addWidget(self.supabase_show_btn)
+
+        supabase_layout.addRow("API Key:", supabase_key_layout)
+
+        # 연결 테스트 버튼
+        test_btn_layout = QHBoxLayout()
+        self.supabase_test_btn = QPushButton("연결 테스트")
+        self.supabase_test_btn.clicked.connect(self._test_supabase_connection)
+        test_btn_layout.addWidget(self.supabase_test_btn)
+
+        self.supabase_status_label = QLabel("")
+        self.supabase_status_label.setStyleSheet("font-size: 11px;")
+        test_btn_layout.addWidget(self.supabase_status_label)
+        test_btn_layout.addStretch()
+
+        supabase_layout.addRow("", test_btn_layout)
+
+        supabase_hint = QLabel("💡 Supabase 대시보드 → Settings → API에서 확인")
+        supabase_hint.setStyleSheet("color: #888; font-size: 10px;")
+        supabase_layout.addRow("", supabase_hint)
+
+        model_layout.addWidget(supabase_group)
         model_layout.addStretch()
 
         tabs.addTab(model_tab, "LLM 모델")
@@ -173,19 +216,43 @@ class SettingsDialog(QDialog):
                 break
         self._on_model_changed()
 
-        # API 키
-        self.gemini_key_edit.setText(self.settings.get("gemini_api_key", ""))
-        self.openai_key_edit.setText(self.settings.get("openai_api_key", ""))
+        # API 키 (설정 파일에 저장된 값만 표시, 환경변수는 실행 시 fallback으로 사용)
+        gemini_key = self.settings.get("gemini_api_key", "")
+        if gemini_key and gemini_key != "your-api-key-here":
+            self.gemini_key_edit.setText(gemini_key)
+        else:
+            # 환경변수에 값이 있으면 placeholder로 힌트 표시
+            env_gemini = os.getenv("GEMINI_API_KEY", "")
+            if env_gemini:
+                self.gemini_key_edit.setPlaceholderText("(.env에서 로드됨 - 변경하려면 입력)")
 
-        # 환경변수에서 키 확인
-        if not self.gemini_key_edit.text():
-            env_key = os.getenv("GEMINI_API_KEY", "")
-            if env_key and env_key != "your-api-key-here":
-                self.gemini_key_edit.setPlaceholderText(f"환경변수에서 로드됨 ({env_key[:8]}...)")
-        if not self.openai_key_edit.text():
-            env_key = os.getenv("OPENAI_API_KEY", "")
+        openai_key = self.settings.get("openai_api_key", "")
+        if openai_key:
+            self.openai_key_edit.setText(openai_key)
+        else:
+            # 환경변수에 값이 있으면 placeholder로 힌트 표시
+            env_openai = os.getenv("OPENAI_API_KEY", "")
+            if env_openai:
+                self.openai_key_edit.setPlaceholderText("(.env에서 로드됨 - 변경하려면 입력)")
+
+        # Supabase 설정 (설정 파일에 저장된 값만 표시, 환경변수는 실행 시 fallback으로 사용)
+        supabase_url = self.settings.get("supabase_url", "")
+        if supabase_url:
+            self.supabase_url_edit.setText(supabase_url)
+        else:
+            # 환경변수에 값이 있으면 placeholder로 힌트 표시
+            env_url = os.getenv("SUPABASE_URL", "") or os.getenv("SUPABASE_PROJECT_URL", "")
+            if env_url:
+                self.supabase_url_edit.setPlaceholderText("(.env에서 로드됨 - 변경하려면 입력)")
+
+        supabase_key = self.settings.get("supabase_key", "")
+        if supabase_key:
+            self.supabase_key_edit.setText(supabase_key)
+        else:
+            # 환경변수에 값이 있으면 placeholder로 힌트 표시
+            env_key = os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_API_KEY", "")
             if env_key:
-                self.openai_key_edit.setPlaceholderText(f"환경변수에서 로드됨 ({env_key[:8]}...)")
+                self.supabase_key_edit.setPlaceholderText("(.env에서 로드됨 - 변경하려면 입력)")
 
         # 스키마
         self.schema_edit.setPlainText(json.dumps(self.schema, ensure_ascii=False, indent=2))
@@ -237,6 +304,15 @@ class SettingsDialog(QDialog):
         self.settings["selected_model"] = self.model_combo.currentData()
         self.settings["gemini_api_key"] = self.gemini_key_edit.text()
         self.settings["openai_api_key"] = self.openai_key_edit.text()
+        self.settings["supabase_url"] = self.supabase_url_edit.text()
+        self.settings["supabase_key"] = self.supabase_key_edit.text()
+
+        # Supabase 클라이언트 리셋 (설정 변경 반영)
+        try:
+            from .supabase_client import reset_supabase_client
+            reset_supabase_client()
+        except ImportError:
+            pass
 
         if save_settings(self.settings):
             # 스키마 저장
@@ -251,3 +327,47 @@ class SettingsDialog(QDialog):
     def get_settings(self) -> dict:
         """현재 설정 반환"""
         return self.settings
+
+    def _test_supabase_connection(self):
+        """Supabase 연결 테스트"""
+        # 현재 입력값을 임시로 저장
+        temp_url = self.supabase_url_edit.text()
+        temp_key = self.supabase_key_edit.text()
+
+        if not temp_url or not temp_key:
+            self.supabase_status_label.setText("URL과 API Key를 입력하세요")
+            self.supabase_status_label.setStyleSheet("color: orange; font-size: 11px;")
+            return
+
+        self.supabase_status_label.setText("연결 중...")
+        self.supabase_status_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.supabase_test_btn.setEnabled(False)
+
+        # UI 업데이트
+        from PyQt5.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            from supabase import create_client
+
+            # 임시 클라이언트로 테스트
+            client = create_client(temp_url, temp_key)
+            result = client.table("textbooks").select("id").limit(1).execute()
+
+            self.supabase_status_label.setText("연결 성공!")
+            self.supabase_status_label.setStyleSheet("color: green; font-size: 11px;")
+
+        except ImportError:
+            self.supabase_status_label.setText("supabase 패키지 필요: pip install supabase")
+            self.supabase_status_label.setStyleSheet("color: red; font-size: 11px;")
+        except Exception as e:
+            error_msg = str(e)
+            if "relation" in error_msg and "does not exist" in error_msg:
+                self.supabase_status_label.setText("테이블 없음 - schema.sql 실행 필요")
+            elif "Invalid" in error_msg:
+                self.supabase_status_label.setText("잘못된 API Key")
+            else:
+                self.supabase_status_label.setText(f"오류: {error_msg[:30]}...")
+            self.supabase_status_label.setStyleSheet("color: red; font-size: 11px;")
+
+        self.supabase_test_btn.setEnabled(True)

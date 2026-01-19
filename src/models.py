@@ -36,5 +36,10 @@ class QuestionBox:
     box_id: Optional[str] = None  # 고유 ID
     ai_result: Optional[dict] = None  # AI 분석 결과 (JSON)
 
+    @property
+    def id(self) -> Optional[str]:
+        """box_id의 별칭"""
+        return self.box_id
+
     def to_dict(self) -> dict:
         return asdict(self)

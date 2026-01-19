@@ -27,6 +27,10 @@ class ImageCanvas(QLabel):
         self._first_corner = None  # 첫 번째 클릭 위치 (QPoint or None)
         self._current_mouse = QPoint()  # 현재 마우스 위치
 
+        # 멀티 해설 모드 (Shift 키)
+        self._multi_solution_mode = False
+        self._multi_solution_boxes = []  # 멀티 모드에서 그린 해설 박스들
+
         # 컬럼 가이드
         self.column_guides = []
         self.show_guides = True
@@ -127,16 +131,31 @@ class ImageCanvas(QLabel):
                 return
 
             # 3. 빈 영역 클릭 = 박스 그리기
+            # Shift 키 상태 확인 (멀티 해설 모드)
+            shift_pressed = event.modifiers() & Qt.ShiftModifier
+
             if self._first_corner is None:
                 # 첫 번째 클릭: 시작점 설정
                 self._first_corner = pos
                 self._current_mouse = pos
+
+                # Shift 키로 멀티 모드 시작
+                if shift_pressed and self.parent_window and self.parent_window.solution_mode_checkbox.isChecked():
+                    if not self._multi_solution_mode:
+                        self._multi_solution_mode = True
+                        self._multi_solution_boxes = []
+                        self.parent_window.status_label.setText("멀티 해설 모드: 여러 박스 그리기 (Shift 떼면 완료)")
+
                 self.update()
                 if self.parent_window:
-                    self.parent_window.status_label.setText("두 번째 클릭으로 박스 완성 (ESC/우클릭: 취소)")
+                    if self._multi_solution_mode:
+                        count = len(self._multi_solution_boxes)
+                        self.parent_window.status_label.setText(f"멀티 해설 모드 ({count}개) - 두 번째 클릭으로 박스 완성")
+                    else:
+                        self.parent_window.status_label.setText("두 번째 클릭으로 박스 완성 (ESC/우클릭: 취소)")
             else:
                 # 두 번째 클릭: 박스 생성
-                self._complete_box(pos)
+                self._complete_box(pos, shift_pressed)
 
         elif event.button() == Qt.RightButton:
             if self._first_corner is not None:
@@ -148,7 +167,7 @@ class ImageCanvas(QLabel):
                 if box_idx is not None and self.parent_window:
                     self.parent_window.delete_box_on_canvas(box_idx)
 
-    def _complete_box(self, end_point):
+    def _complete_box(self, end_point, shift_pressed=False):
         """박스 그리기 완료"""
         start = self._first_corner
 
@@ -165,8 +184,16 @@ class ImageCanvas(QLabel):
 
         if width >= self.MIN_BOX_SIZE and height >= self.MIN_BOX_SIZE:
             if self.parent_window:
-                self.parent_window.add_box(start, end_point)
-                self.parent_window.status_label.setText("박스가 추가되었습니다")
+                # 멀티 해설 모드인 경우
+                if self._multi_solution_mode:
+                    box = self.parent_window.add_box(start, end_point, skip_dialog=True)
+                    if box:
+                        self._multi_solution_boxes.append(box)
+                    count = len(self._multi_solution_boxes)
+                    self.parent_window.status_label.setText(f"멀티 해설 모드 ({count}개 추가됨) - Shift 떼면 문항 연결")
+                else:
+                    self.parent_window.add_box(start, end_point)
+                    self.parent_window.status_label.setText("박스가 추가되었습니다")
         else:
             if self.parent_window:
                 self.parent_window.status_label.setText(
@@ -198,7 +225,31 @@ class ImageCanvas(QLabel):
             if self._first_corner is not None:
                 self.cancel_drawing()
                 return
+            # 멀티 모드 취소
+            if self._multi_solution_mode:
+                self._multi_solution_mode = False
+                self._multi_solution_boxes = []
+                if self.parent_window:
+                    self.parent_window.status_label.setText("멀티 해설 모드 취소됨")
+                return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Shift 키를 떼면 멀티 해설 모드 종료"""
+        if event.key() == Qt.Key_Shift:
+            if self._multi_solution_mode and self._multi_solution_boxes:
+                boxes = self._multi_solution_boxes.copy()
+                self._multi_solution_mode = False
+                self._multi_solution_boxes = []
+                # 부모에게 다이얼로그 표시 요청
+                if self.parent_window:
+                    self.parent_window._show_solution_link_dialog(boxes)
+            elif self._multi_solution_mode:
+                # 박스 없이 Shift 떼면 모드만 종료
+                self._multi_solution_mode = False
+                if self.parent_window:
+                    self.parent_window.status_label.setText("멀티 해설 모드 종료 (박스 없음)")
+        super().keyReleaseEvent(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -288,9 +339,9 @@ class ImageCanvas(QLabel):
         return box_labels
 
     def _draw_box_label(self, painter, box, x, y, color, box_labels, parent):
-        """박스 라벨 그리기"""
+        """박스 라벨 그리기 (전체박스목록과 동일한 형식)"""
         box_num = box_labels.get(id(box), 1)
-        type_icon = "Q" if box.box_type == BOX_TYPE_QUESTION else "S"
+        is_question = box.box_type == BOX_TYPE_QUESTION
 
         theme_name = "미지정"
         if box.theme_id:
@@ -298,14 +349,46 @@ class ImageCanvas(QLabel):
             if theme:
                 theme_name = theme.name
 
-        label = f"[{type_icon}] {theme_name}-{box_num:02d}"
-        if box.number:
-            label += f" #{box.number}"
+        if is_question:
+            # 문제: 📝 테마명-01
+            label = f"📝 {theme_name}-{box_num:02d}"
+        else:
+            # 해설: 📖 테마명-01 해설
+            if box.linked_box_id:
+                # 연결된 해설 - 연결된 문제 번호 찾기
+                linked_q_num = self._find_linked_question_num(box, parent)
+                if linked_q_num:
+                    label = f"📖 {theme_name}-{linked_q_num:02d} 해설"
+                else:
+                    label = f"📖 {theme_name}-{box_num:02d} 해설"
+            else:
+                label = f"📖 {theme_name}-{box_num:02d} 해설 (미연결)"
 
         pen = QPen(color, 1)
         pen.setStyle(Qt.SolidLine)
         painter.setPen(pen)
         painter.drawText(x, y - 5, label)
+
+    def _find_linked_question_num(self, solution_box, parent):
+        """해설이 연결된 문제의 순번 찾기"""
+        if not solution_box.linked_box_id or not parent:
+            return None
+
+        # 같은 테마의 문제들 수집
+        questions = []
+        for page_idx, page_boxes in parent.boxes.items():
+            for box in page_boxes:
+                if box.box_type == BOX_TYPE_QUESTION and box.theme_id == solution_box.theme_id:
+                    questions.append((page_idx, box))
+
+        # 정렬
+        questions.sort(key=lambda x: parent._get_box_sort_key(x[0], x[1]))
+
+        # 연결된 문제의 순번 찾기
+        for idx, (page_idx, box) in enumerate(questions, 1):
+            if box.box_id == solution_box.linked_box_id:
+                return idx
+        return None
 
     def _draw_delete_button(self, painter, x2, y1):
         """삭제 버튼 그리기"""

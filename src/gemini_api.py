@@ -8,8 +8,6 @@ import re
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-import cv2
-import numpy as np
 from dotenv import load_dotenv
 from PIL import Image
 from PyQt5.QtCore import QThread, pyqtSignal, QUrl, QRect, QPoint
@@ -94,8 +92,79 @@ def crop_box_image(page_image: Image.Image, box: QuestionBox) -> Image.Image:
     return page_image.crop((x1, y1, x2, y2))
 
 
-def generate_katex_html(text: str, choices: list = None) -> str:
+def fix_latex_delimiters(text: str) -> str:
+    """LaTeX 수식 구분자가 제대로 닫히지 않은 경우 자동 보정
+
+    예:
+    - $$수식 내용 → $$수식 내용$$
+    - lim_{x \to 0} ... 의 값은? → $$lim_{x \to 0} ...$$ 의 값은?
+    """
+    import re
+
+    # 1. $ 구분자 없이 LaTeX 명령어로 시작하는 수식 감지 및 래핑
+    # LaTeX 명령어 패턴: \command 또는 일반적인 수학 표현 (lim, sum, int, frac 등)
+    latex_commands = r'(?:lim|sum|int|frac|sqrt|sin|cos|tan|log|ln|exp|max|min|sup|inf|prod|bigcup|bigcap|iint|iiint|oint)'
+
+    # 패턴: LaTeX 명령어로 시작하고 "의 값", "을 구", "를 구" 등으로 끝나는 경우
+    def wrap_naked_latex(m):
+        before = m.group(1) or ""
+        content = m.group(2)
+        after = m.group(3)
+        # 이미 $ 안에 있으면 스킵
+        if before.endswith('$'):
+            return m.group(0)
+        return f'{before}$${content}$${after}'
+
+    # 줄 시작 또는 공백 뒤에 LaTeX 명령어가 오고, 특정 한국어 패턴으로 끝나는 경우
+    pattern = rf'(^|\s)({latex_commands}[^$]*?)(\s*(?:의 값|을 구|를 구|이다|입니다|[?]))'
+    text = re.sub(pattern, wrap_naked_latex, text, flags=re.MULTILINE)
+
+    # 2. $$ 블록 처리: 열린 $$ 개수와 닫힌 $$ 개수 확인
+
+    # 먼저 $$...$$ 패턴을 찾아서 보호 (정상적인 블록)
+    protected = []
+    def protect_block(m):
+        protected.append(m.group(0))
+        return f"__PROTECTED_{len(protected)-1}__"
+
+    # 정상적인 $$...$$ 블록 보호
+    text = re.sub(r'\$\$[^$]+\$\$', protect_block, text)
+
+    # 남은 $$ 찾기 (닫히지 않은 블록)
+    def fix_unclosed_display(m):
+        content = m.group(1)
+        if content.strip().endswith('$$'):
+            return m.group(0)
+        return f'$${content}$$'
+
+    # $$로 시작하고 줄 끝이나 특정 패턴까지
+    text = re.sub(r'\$\$([^$]+?)(?=\s*(?:의 값|을 구|를 구|이다|입니다|[.?!]|$))', fix_unclosed_display, text)
+
+    # 보호된 블록 복원
+    for i, block in enumerate(protected):
+        text = text.replace(f"__PROTECTED_{i}__", block)
+
+    # 3. 인라인 $ 수식 처리: 홀수 개의 $가 있으면 마지막에 $ 추가
+    parts = re.split(r'(\$\$[^$]+\$\$)', text)
+    result_parts = []
+
+    for part in parts:
+        if part.startswith('$$') and part.endswith('$$'):
+            result_parts.append(part)
+        else:
+            dollar_count = part.count('$')
+            if dollar_count % 2 == 1:
+                part = part + '$'
+            result_parts.append(part)
+
+    return ''.join(result_parts)
+
+
+def generate_katex_html(text: str, choices: list = None, sub_questions: list = None) -> str:
     """텍스트와 LaTeX 수식을 KaTeX로 렌더링하는 HTML 생성"""
+    # 수식 구분자 자동 보정
+    text = fix_latex_delimiters(text)
+
     # HTML 이스케이프 (단, $ 기호는 유지)
     def escape_html(s):
         return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -105,14 +174,24 @@ def generate_katex_html(text: str, choices: list = None) -> str:
     # 줄바꿈을 <br>로 변환
     escaped_text = escaped_text.replace('\n', '<br>')
 
-    # 선택지 HTML 생성
+    # 보기(sub_questions) HTML 생성 - 선택지 위에 표시
+    sub_questions_html = ""
+    if sub_questions:
+        sub_questions_html = "<div class='sub-questions'><div class='sub-questions-title'>〈보기〉</div>"
+        for sq in sub_questions:
+            label = escape_html(sq.get("label", ""))
+            sq_text = escape_html(sq.get("text", ""))
+            sub_questions_html += f"<div class='sub-question'><span class='sq-label'>{label}</span>{sq_text}</div>"
+        sub_questions_html += "</div>"
+
+    # 선택지 HTML 생성 - 한 줄 배치
     choices_html = ""
     if choices:
         choices_html = "<div class='choices'>"
         for choice in choices:
             label = escape_html(choice.get("label", ""))
             choice_text = escape_html(choice.get("text", ""))
-            choices_html += f"<div class='choice'><span class='label'>{label}</span> {choice_text}</div>"
+            choices_html += f"<span class='choice'><span class='label'>{label}</span>{choice_text}</span>"
         choices_html += "</div>"
 
     html = f'''<!DOCTYPE html>
@@ -135,16 +214,49 @@ def generate_katex_html(text: str, choices: list = None) -> str:
         .question-text {{
             margin-bottom: 20px;
         }}
+        .sub-questions {{
+            margin: 15px 0;
+            padding: 12px 15px;
+            background: #fff8e1;
+            border: 1px solid #ffe082;
+            border-radius: 6px;
+        }}
+        .sub-questions-title {{
+            font-weight: bold;
+            color: #f57c00;
+            margin-bottom: 8px;
+        }}
+        .sub-question {{
+            margin: 6px 0;
+            padding-left: 10px;
+        }}
+        .sq-label {{
+            font-weight: bold;
+            color: #e65100;
+            margin-right: 8px;
+        }}
         .choices {{
             margin-top: 15px;
+            padding: 5px 8px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            align-items: center;
         }}
         .choice {{
-            margin: 8px 0;
-            padding: 5px 0;
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 8px;
+            background: white;
+            border-radius: 4px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.08);
         }}
         .choice .label {{
             font-weight: bold;
-            margin-right: 8px;
+            margin-right: 6px;
+            color: #007bff;
         }}
         .katex {{
             font-size: 1.1em;
@@ -157,6 +269,7 @@ def generate_katex_html(text: str, choices: list = None) -> str:
 </head>
 <body>
     <div class="question-text">{escaped_text}</div>
+    {sub_questions_html}
     {choices_html}
     <script>
         document.addEventListener("DOMContentLoaded", function() {{
@@ -165,7 +278,8 @@ def generate_katex_html(text: str, choices: list = None) -> str:
                     {{left: "$$", right: "$$", display: true}},
                     {{left: "$", right: "$", display: false}}
                 ],
-                throwOnError: false
+                throwOnError: false,
+                strict: false
             }});
         }});
     </script>
@@ -176,24 +290,40 @@ def generate_katex_html(text: str, choices: list = None) -> str:
 
 def _call_gemini_api(model_id: str, prompt: str, image_bytes: bytes) -> str:
     """Gemini API 호출"""
+    import sys
+    print(f"[DEBUG] Gemini API 호출 시작: model={model_id}", file=sys.stderr, flush=True)
+
     client = get_gemini_client()
     if not client:
         raise ValueError("Gemini API 키가 설정되지 않았습니다. 설정에서 API 키를 입력하거나 .env 파일을 확인하세요.")
 
     from google.genai import types
-    response = client.models.generate_content(
-        model=model_id,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(text=prompt),
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-                ]
+
+    try:
+        print(f"[DEBUG] generate_content 호출 중...", file=sys.stderr, flush=True)
+        response = client.models.generate_content(
+            model=model_id,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(text=prompt),
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                    ]
+                )
+            ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=8192,  # 출력 토큰 제한 증가
+                temperature=0.1,  # 일관된 출력을 위해 낮은 temperature
             )
-        ]
-    )
-    return response.text
+        )
+        print(f"[DEBUG] 응답 수신 완료", file=sys.stderr, flush=True)
+        if not response.text:
+            raise ValueError("API 응답이 비어있습니다.")
+        return response.text
+    except Exception as e:
+        print(f"[DEBUG] API 에러: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        raise ValueError(f"Gemini API 호출 실패: {str(e)}")
 
 
 def _call_openai_api(model_id: str, prompt: str, image_bytes: bytes) -> str:
@@ -270,9 +400,12 @@ JSON만 반환하세요."""
 
 def analyze_image_with_llm(image: Image.Image, box_type: str, theme_name: str) -> dict:
     """이미지를 선택된 LLM으로 분석하여 구조화된 JSON 반환"""
+    import sys
     settings = load_settings()
     model_id = settings.get("selected_model", "gemini-2.0-flash-exp")
     model_info = get_model_by_id(model_id)
+
+    print(f"[DEBUG] analyze_image_with_llm: selected_model={model_id}, provider={model_info.provider if model_info else 'None'}", file=sys.stderr, flush=True)
 
     if not model_info:
         raise ValueError(f"알 수 없는 모델: {model_id}")
@@ -315,8 +448,18 @@ def analyze_image_with_llm(image: Image.Image, box_type: str, theme_name: str) -
 
     # LaTeX 백슬래시 이스케이프 처리
     # JSON 파싱 전에 잘못된 이스케이프 시퀀스 수정
+    def _add_model_info(result: dict) -> dict:
+        """분석 결과에 모델 정보 추가"""
+        result["model"] = {
+            "id": model_id,
+            "name": model_info.name,
+            "provider": model_info.provider
+        }
+        return result
+
     try:
-        return json.loads(response_text)
+        result = json.loads(response_text)
+        return _add_model_info(result)
     except json.JSONDecodeError:
         # 백슬래시가 제대로 이스케이프되지 않은 경우 처리
         # 일반적인 LaTeX 명령어들의 백슬래시를 이중 백슬래시로 변환
@@ -340,14 +483,16 @@ def analyze_image_with_llm(image: Image.Image, box_type: str, theme_name: str) -
             fixed_text = re.sub(r'(?<!\\)\\(' + cmd + r')', r'\\\\' + cmd, fixed_text)
 
         try:
-            return json.loads(fixed_text)
+            result = json.loads(fixed_text)
+            return _add_model_info(result)
         except json.JSONDecodeError:
             # 그래도 실패하면 raw_decode 시도
             # 또는 문자열을 직접 파싱
             import ast
             try:
                 # Python literal로 파싱 시도
-                return ast.literal_eval(response_text)
+                result = ast.literal_eval(response_text)
+                return _add_model_info(result)
             except:
                 raise ValueError(f"JSON 파싱 실패: {response_text[:500]}")
 
@@ -356,333 +501,54 @@ def analyze_image_with_llm(image: Image.Image, box_type: str, theme_name: str) -
 analyze_image_with_gemini = analyze_image_with_llm
 
 
-def detect_graph_regions_cv(image: Image.Image) -> Tuple[List[dict], List[str]]:
-    """OpenCV를 사용하여 그래프/그림 영역을 자동 검출
-
-    Returns:
-        Tuple of (detected_regions, debug_messages)
-        - detected_regions: List of {"bbox": {"x1", "y1", "x2", "y2"}, "confidence": float}
-        - debug_messages: 디버그 메시지 목록
-        좌표는 상대 좌표 (0~1)
-    """
-    # PIL -> OpenCV 변환
-    img_array = np.array(image.convert("RGB"))
-    img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-
-    h, w = gray.shape
-    detected_regions = []
-    debug_messages = []
-
-    # 그래프 최소 크기 기준 (픽셀)
-    MIN_GRAPH_WIDTH = 200
-    MIN_GRAPH_HEIGHT = 200
-
-    debug_messages.append(f"[CV] 이미지 크기: {w}x{h}")
-
-    # 방법 1: 엣지 검출로 그래프 영역 찾기
-    edges = cv2.Canny(gray, 50, 150)
-
-    # 모폴로지 연산으로 노이즈 제거 및 영역 연결
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges_dilated = cv2.dilate(edges, kernel, iterations=3)
-    edges_closed = cv2.morphologyEx(edges_dilated, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    # 컨투어 찾기
-    contours, _ = cv2.findContours(edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    debug_messages.append(f"[CV] 검출된 컨투어 수: {len(contours)}")
-
-    # 4단계: 컨투어 필터링 (완화된 조건)
-    filtered_by_size = 0
-    filtered_by_aspect = 0
-    filtered_by_too_large = 0
-
-    for contour in contours:
-        x, y, cw, ch = cv2.boundingRect(contour)
-
-        # 최소 크기 체크 (100x100으로 완화)
-        if cw < 100 or ch < 100:
-            filtered_by_size += 1
-            continue
-
-        # 최대 크기 체크 - 문항 전체를 감싸는 박스 제외 (이미지의 50% 이상)
-        bbox_area_ratio = (cw * ch) / (w * h)
-        if bbox_area_ratio > 0.5:
-            filtered_by_too_large += 1
-            debug_messages.append(f"[CV] 너무 큰 영역 제외: {cw}x{ch} (면적비율={bbox_area_ratio:.2f})")
-            continue
-
-        # 종횡비 체크 (0.2 ~ 5.0으로 완화)
-        aspect_ratio = cw / ch if ch > 0 else 0
-        if 0.2 < aspect_ratio < 5.0:
-            # 상대 좌표로 변환 (여유 마진 추가)
-            margin = 0.02
-            x1 = max(0, x / w - margin)
-            y1 = max(0, y / h - margin)
-            x2 = min(1, (x + cw) / w + margin)
-            y2 = min(1, (y + ch) / h + margin)
-
-            area = cv2.contourArea(contour)
-            confidence = min(1.0, area / (w * h * 0.1))  # 크기 기반 신뢰도
-            detected_regions.append({
-                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                "confidence": confidence,
-                "description": "CV 검출 영역"
-            })
-            debug_messages.append(f"[CV] 컨투어 검출: {cw}x{ch}, 면적비율={bbox_area_ratio:.2f}, 신뢰도={confidence:.2f}")
-        else:
-            filtered_by_aspect += 1
-
-    if filtered_by_size > 0:
-        debug_messages.append(f"[CV] 최소크기(100x100)로 필터된 영역: {filtered_by_size}개")
-    if filtered_by_aspect > 0:
-        debug_messages.append(f"[CV] 종횡비(0.2~5.0)로 필터된 영역: {filtered_by_aspect}개")
-    if filtered_by_too_large > 0:
-        debug_messages.append(f"[CV] 너무 큰 영역(>50%)으로 필터된 영역: {filtered_by_too_large}개")
-
-    # 5단계: 직선 검출 (비활성화 - 컨투어 검출만 사용)
-    # 직선 기반 검출은 문제 전체 영역을 잡는 경우가 많아 비활성화
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=30, maxLineGap=10)
-    debug_messages.append(f"[CV] 직선 검출: {len(lines) if lines is not None else 0}개 (참고용, 사용안함)")
-
-    # 중복 영역 병합
-    merged = merge_overlapping_regions(detected_regions)
-
-    # 신뢰도 순으로 정렬
-    merged.sort(key=lambda x: x.get("confidence", 0), reverse=True)
-
-    debug_messages.append(f"[CV] 최종 검출 결과: {len(merged[:3])}개 그래프")
-
-    return merged[:3], debug_messages  # 최대 3개 반환
-
-
-def merge_overlapping_regions(regions: List[dict], iou_threshold: float = 0.5) -> List[dict]:
-    """겹치는 영역을 병합"""
-    if not regions:
-        return []
-
-    def iou(box1, box2):
-        """Intersection over Union 계산"""
-        x1 = max(box1["x1"], box2["x1"])
-        y1 = max(box1["y1"], box2["y1"])
-        x2 = min(box1["x2"], box2["x2"])
-        y2 = min(box1["y2"], box2["y2"])
-
-        if x2 <= x1 or y2 <= y1:
-            return 0
-
-        intersection = (x2 - x1) * (y2 - y1)
-        area1 = (box1["x2"] - box1["x1"]) * (box1["y2"] - box1["y1"])
-        area2 = (box2["x2"] - box2["x1"]) * (box2["y2"] - box2["y1"])
-        union = area1 + area2 - intersection
-
-        return intersection / union if union > 0 else 0
-
-    merged = []
-    used = set()
-
-    for i, r1 in enumerate(regions):
-        if i in used:
-            continue
-
-        # 현재 영역과 겹치는 모든 영역 찾기
-        group = [r1]
-        for j, r2 in enumerate(regions):
-            if j != i and j not in used:
-                if iou(r1["bbox"], r2["bbox"]) > iou_threshold:
-                    group.append(r2)
-                    used.add(j)
-
-        # 그룹의 bbox 병합 (가장 큰 영역으로)
-        if group:
-            x1 = min(r["bbox"]["x1"] for r in group)
-            y1 = min(r["bbox"]["y1"] for r in group)
-            x2 = max(r["bbox"]["x2"] for r in group)
-            y2 = max(r["bbox"]["y2"] for r in group)
-            max_conf = max(r.get("confidence", 0) for r in group)
-
-            merged.append({
-                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                "confidence": max_conf,
-                "description": group[0].get("description", "")
-            })
-
-        used.add(i)
-
-    return merged
-
-
-def refine_graph_bbox_with_cv(image: Image.Image, llm_bbox: dict) -> dict:
-    """LLM이 제공한 bbox를 CV로 보정
-
-    LLM bbox를 기준으로 주변 영역을 분석하여 더 정확한 경계 찾기
-    """
-    img_array = np.array(image.convert("RGB"))
-    h, w = img_array.shape[:2]
-
-    # LLM bbox를 픽셀 좌표로 변환
-    x1 = int(llm_bbox.get("x1", 0) * w)
-    y1 = int(llm_bbox.get("y1", 0) * h)
-    x2 = int(llm_bbox.get("x2", 1) * w)
-    y2 = int(llm_bbox.get("y2", 1) * h)
-
-    # 검색 영역 확장 (bbox 주변 20% 여유)
-    margin_x = int((x2 - x1) * 0.2)
-    margin_y = int((y2 - y1) * 0.2)
-
-    search_x1 = max(0, x1 - margin_x)
-    search_y1 = max(0, y1 - margin_y)
-    search_x2 = min(w, x2 + margin_x)
-    search_y2 = min(h, y2 + margin_y)
-
-    # 검색 영역 추출
-    roi = img_array[search_y1:search_y2, search_x1:search_x2]
-    if roi.size == 0:
-        return llm_bbox
-
-    # 그레이스케일 변환 및 엣지 검출
-    gray_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-    edges = cv2.Canny(gray_roi, 30, 100)
-
-    # 컨투어 찾기
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return llm_bbox
-
-    # 가장 큰 컨투어 찾기
-    largest = max(contours, key=cv2.contourArea)
-    rx, ry, rw, rh = cv2.boundingRect(largest)
-
-    # ROI 좌표를 전체 이미지 좌표로 변환
-    new_x1 = search_x1 + rx
-    new_y1 = search_y1 + ry
-    new_x2 = search_x1 + rx + rw
-    new_y2 = search_y1 + ry + rh
-
-    # 마진 추가
-    margin = 0.02
-    return {
-        "x1": max(0, new_x1 / w - margin),
-        "y1": max(0, new_y1 / h - margin),
-        "x2": min(1, new_x2 / w + margin),
-        "y2": min(1, new_y2 / h + margin)
-    }
-
-
-def extract_graph_images(image: Image.Image, result: dict, use_cv_detection: bool = True) -> dict:
-    """AI 분석 결과에서 그래프 영역을 크롭하여 base64로 저장
+def extract_graph_images(image: Image.Image, result: dict, use_cv_detection: bool = False) -> dict:
+    """AI가 추출한 bbox_percent를 사용하여 그래프 이미지를 base64로 추출
 
     Args:
-        image: 원본 이미지
-        result: LLM 분석 결과
-        use_cv_detection: CV로 그래프 검출 여부 (기본: True - 항상 CV 사용)
+        image: 원본 박스 이미지
+        result: LLM 분석 결과 (figures에 bbox_percent 포함)
+        use_cv_detection: 사용 안 함 (호환성 유지)
+
+    Returns:
+        figures에 figure_image_base64가 추가된 result
     """
     content = result.get("content", {})
-    debug_messages = []
+    figures = content.get("figures", [])
 
-    img_w, img_h = image.size
-
-    # 그래프 최소 크기 기준 (픽셀)
-    MIN_GRAPH_WIDTH = 200
-    MIN_GRAPH_HEIGHT = 200
-
-    # 항상 CV로 그래프 검출 (LLM 결과 무시)
-    graphs = []
-    if use_cv_detection:
-        debug_messages.append("[모드] OpenCV로 그래프 검출 (LLM 결과 무시)")
-        cv_detected, cv_debug = detect_graph_regions_cv(image)
-        debug_messages.extend(cv_debug)
-        if cv_detected:
-            graphs = cv_detected
-            content["graphs"] = graphs
-            result["content"] = content
-        else:
-            debug_messages.append("[CV] 그래프를 찾지 못함")
-            content["graphs"] = []
-            result["content"] = content
-    else:
-        # LLM 결과 사용 (기존 방식)
-        graphs = content.get("graphs", [])
-        debug_messages.append(f"[LLM] 그래프 검출 결과: {len(graphs)}개")
-
-    if not graphs:
-        result["_graph_debug"] = debug_messages
+    if not figures or not image:
         return result
 
-    debug_messages.append(f"[이미지] 크기: {img_w}x{img_h}")
+    img_width, img_height = image.size
 
-    valid_graphs = []
-    for i, graph in enumerate(graphs):
-        bbox = graph.get("bbox", {})
-        original_bbox_str = f"x1={bbox.get('x1', 0):.3f}, y1={bbox.get('y1', 0):.3f}, x2={bbox.get('x2', 0):.3f}, y2={bbox.get('y2', 0):.3f}"
-        debug_messages.append(f"[그래프 {i+1}] LLM bbox: {original_bbox_str}")
-
-        # CV 보정 비활성화 - LLM bbox가 더 정확하고 CV가 잘못 축소하는 경우가 있음
-        # if use_cv_refinement and bbox:
-        #     refined_bbox = refine_graph_bbox_with_cv(image, bbox)
-        #     graph["original_bbox"] = bbox.copy()
-        #     graph["bbox"] = refined_bbox
-        #     refined_str = f"x1={refined_bbox.get('x1', 0):.3f}, ..."
-        #     debug_messages.append(f"[그래프 {i+1}] CV 보정 bbox: {refined_str}")
-        #     bbox = refined_bbox
-
-        x1 = bbox.get("x1", 0)
-        y1 = bbox.get("y1", 0)
-        x2 = bbox.get("x2", 0)
-        y2 = bbox.get("y2", 0)
-
-        # 상대 좌표(0~1)인지 절대 좌표인지 판단
-        if all(0 <= v <= 1 for v in [x1, y1, x2, y2]):
-            # 상대 좌표 → 픽셀 좌표로 변환
-            px1 = int(x1 * img_w)
-            py1 = int(y1 * img_h)
-            px2 = int(x2 * img_w)
-            py2 = int(y2 * img_h)
-        else:
-            # 절대 좌표 그대로 사용
-            px1, py1, px2, py2 = int(x1), int(y1), int(x2), int(y2)
-
-        # 좌표 유효성 검사
-        px1 = max(0, min(px1, img_w))
-        py1 = max(0, min(py1, img_h))
-        px2 = max(0, min(px2, img_w))
-        py2 = max(0, min(py2, img_h))
-
-        graph_width = px2 - px1
-        graph_height = py2 - py1
-        debug_messages.append(f"[그래프 {i+1}] 픽셀 크기: {graph_width}x{graph_height}")
-
-        # 최소 크기 체크 - 너무 작은 그래프는 무시
-        if graph_width < MIN_GRAPH_WIDTH or graph_height < MIN_GRAPH_HEIGHT:
-            debug_messages.append(
-                f"[그래프 {i+1}] ⚠️ 최소크기 미달로 제외: {graph_width}x{graph_height} "
-                f"(기준: {MIN_GRAPH_WIDTH}x{MIN_GRAPH_HEIGHT})"
-            )
+    for fig in figures:
+        bbox = fig.get("bbox_percent")
+        if not bbox:
             continue
 
-        if px2 > px1 and py2 > py1:
-            # 이미지 크롭
-            cropped = image.crop((px1, py1, px2, py2))
+        try:
+            # bbox_percent를 실제 픽셀 좌표로 변환
+            x1 = int(bbox.get("x1", 0) * img_width)
+            y1 = int(bbox.get("y1", 0) * img_height)
+            x2 = int(bbox.get("x2", 1) * img_width)
+            y2 = int(bbox.get("y2", 1) * img_height)
 
-            # base64로 변환
+            # 유효성 검사
+            x1, x2 = max(0, min(x1, x2)), min(img_width, max(x1, x2))
+            y1, y2 = max(0, min(y1, y2)), min(img_height, max(y1, y2))
+
+            if x2 - x1 < 10 or y2 - y1 < 10:
+                continue
+
+            # 크롭 및 base64 인코딩
+            cropped = image.crop((x1, y1, x2, y2))
             buffer = io.BytesIO()
-            cropped.save(buffer, format="PNG")
-            image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            cropped.save(buffer, format='PNG')
+            buffer.seek(0)
+            fig["figure_image_base64"] = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-            # 결과에 추가
-            graph["image_base64"] = image_base64
-            valid_graphs.append(graph)
-            debug_messages.append(f"[그래프 추가] 크기: {graph_width}x{graph_height}")
-
-    # 유효한 그래프만 결과에 반영
-    content["graphs"] = valid_graphs
-    result["content"] = content
-
-    # 디버그 정보 추가
-    debug_messages.append(f"[최종] 유효한 그래프: {len(valid_graphs)}개")
-    result["_graph_debug"] = debug_messages
+        except Exception as e:
+            print(f"그래프 이미지 추출 실패: {e}")
+            continue
 
     return result
 
@@ -1006,7 +872,10 @@ class GraphBboxEditor(QLabel):
 
 
 class AnalysisResultDialog(QDialog):
-    """AI 분석 결과 표시 다이얼로그"""
+    """AI 분석 결과 표시 다이얼로그 (모달리스)"""
+
+    # 결과 저장 시그널 (수정된 result를 전달)
+    result_saved = pyqtSignal(dict)
 
     def __init__(self, result: dict, box_image: Image.Image, parent=None):
         super().__init__(parent)
@@ -1015,6 +884,9 @@ class AnalysisResultDialog(QDialog):
         self.result = extract_graph_images(box_image, result)
         self.setWindowTitle("AI 분석 결과")
         self.setMinimumSize(900, 700)
+        # 모달리스로 설정
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1024,8 +896,13 @@ class AnalysisResultDialog(QDialog):
         tabs = QTabWidget()
 
         content = self.result.get("content", {})
-        question_text = content.get("question_text", "")
+        # 문제 타입이면 question_text, 해설 타입이면 solution_text 사용
+        question_text = content.get("question_text", "") or content.get("solution_text", "")
         choices = content.get("choices", [])
+        sub_questions = content.get("sub_questions", [])
+        # 해설 타입 전용 필드
+        answer = content.get("answer", "")
+        key_concepts = content.get("key_concepts", [])
 
         # 탭 1: KaTeX 렌더링 결과
         render_tab = QWidget()
@@ -1044,7 +921,7 @@ class AnalysisResultDialog(QDialog):
 
         # KaTeX로 렌더링된 웹뷰
         self.web_view = QWebEngineView()
-        html = generate_katex_html(question_text, choices)
+        html = generate_katex_html(question_text, choices, sub_questions)
         self.web_view.setHtml(html)
         self.web_view.setMinimumHeight(300)
         render_layout.addWidget(self.web_view)
@@ -1084,9 +961,11 @@ class AnalysisResultDialog(QDialog):
         text_tab = QWidget()
         text_layout = QVBoxLayout(text_tab)
 
-        # 문항 본문
+        # 문항 본문 (문제) 또는 해설 본문 (해설)
+        is_solution = bool(content.get("solution_text"))
         if question_text:
-            text_group = QGroupBox("문항 본문 (LaTeX 원문)")
+            group_title = "해설 본문 (LaTeX 원문)" if is_solution else "문항 본문 (LaTeX 원문)"
+            text_group = QGroupBox(group_title)
             group_layout = QVBoxLayout(text_group)
             text_edit = QTextEdit()
             text_edit.setPlainText(question_text)
@@ -1095,7 +974,27 @@ class AnalysisResultDialog(QDialog):
             group_layout.addWidget(text_edit)
             text_layout.addWidget(text_group)
 
-        # 선택지
+        # 해설 타입: 정답 표시
+        if answer:
+            answer_group = QGroupBox("정답")
+            answer_layout = QVBoxLayout(answer_group)
+            answer_label = QLabel(str(answer))
+            answer_label.setFont(QFont("Courier", 14, QFont.Bold))
+            answer_label.setStyleSheet("color: #0066cc; padding: 10px;")
+            answer_layout.addWidget(answer_label)
+            text_layout.addWidget(answer_group)
+
+        # 해설 타입: 핵심 개념 표시
+        if key_concepts:
+            concepts_group = QGroupBox("핵심 개념")
+            concepts_layout = QVBoxLayout(concepts_group)
+            for concept in key_concepts:
+                concept_label = QLabel(f"• {concept}")
+                concept_label.setWordWrap(True)
+                concepts_layout.addWidget(concept_label)
+            text_layout.addWidget(concepts_group)
+
+        # 선택지 (문제 타입)
         if choices:
             choices_group = QGroupBox("선택지")
             choices_layout = QVBoxLayout(choices_group)
@@ -1137,7 +1036,126 @@ class AnalysisResultDialog(QDialog):
         text_layout.addStretch()
         tabs.addTab(text_tab, "텍스트 원문")
 
-        # 탭 4: JSON 원본
+        # 탭 4: 도형 해석 (수학적 해석 데이터)
+        figures = content.get("figures", []) or content.get("graphs", [])
+        if figures:
+            figure_tab = QWidget()
+            figure_layout = QVBoxLayout(figure_tab)
+
+            # 안내 메시지
+            render_info = QLabel("AI가 도형/그래프를 수학적으로 해석한 결과입니다.")
+            render_info.setStyleSheet("color: #0066cc; font-weight: bold; padding: 8px; background: #e8f4ff; border-radius: 4px;")
+            figure_layout.addWidget(render_info)
+
+            scroll_content = QWidget()
+            scroll_layout = QVBoxLayout(scroll_content)
+
+            for i, fig in enumerate(figures):
+                fig_type = fig.get("figure_type", "") or fig.get("graph_type", "unknown")
+                verbal = fig.get("verbal_description", "") or fig.get("description", "")
+
+                group = QGroupBox(f"도형 {i+1}: {fig_type}")
+                group_layout = QVBoxLayout(group)
+
+                # 자연어 설명
+                if verbal:
+                    desc_label = QLabel(f"<b>설명:</b> {verbal}")
+                    desc_label.setWordWrap(True)
+                    desc_label.setStyleSheet("padding: 5px; background: #e8f4fc; border-radius: 4px;")
+                    group_layout.addWidget(desc_label)
+
+                # 수학적 요소
+                math_elem = fig.get("mathematical_elements", {})
+
+                # 방정식
+                equations = math_elem.get("equations", [])
+                if equations:
+                    eq_text = "<b>방정식:</b><br>" + "<br>".join(f"  • {eq}" for eq in equations)
+                    eq_label = QLabel(eq_text)
+                    eq_label.setWordWrap(True)
+                    group_layout.addWidget(eq_label)
+
+                # 제약 조건
+                constraints = math_elem.get("constraints", [])
+                if constraints:
+                    const_text = "<b>조건:</b><br>" + "<br>".join(f"  • {c}" for c in constraints)
+                    const_label = QLabel(const_text)
+                    const_label.setWordWrap(True)
+                    group_layout.addWidget(const_label)
+
+                # 주요 점
+                key_points = math_elem.get("key_points", [])
+                if key_points:
+                    pts_lines = []
+                    for pt in key_points:
+                        name = pt.get("name", "")
+                        coords = pt.get("coords", [])
+                        sig = pt.get("significance", "")
+                        line = f"  • {name}: {coords}"
+                        if sig:
+                            line += f" ({sig})"
+                        pts_lines.append(line)
+                    pts_text = "<b>주요 점:</b><br>" + "<br>".join(pts_lines)
+                    pts_label = QLabel(pts_text)
+                    pts_label.setWordWrap(True)
+                    group_layout.addWidget(pts_label)
+
+                # 주요 값
+                key_values = math_elem.get("key_values", [])
+                if key_values:
+                    vals_lines = []
+                    for val in key_values:
+                        name = val.get("name", "")
+                        value = val.get("value", "")
+                        of = val.get("of", "")
+                        line = f"  • {name} = {value}"
+                        if of:
+                            line += f" ({of})"
+                        vals_lines.append(line)
+                    vals_text = "<b>주요 값:</b><br>" + "<br>".join(vals_lines)
+                    vals_label = QLabel(vals_text)
+                    vals_label.setWordWrap(True)
+                    group_layout.addWidget(vals_label)
+
+                # 성질
+                props = fig.get("properties", {})
+                if props and isinstance(props, dict):
+                    props_lines = []
+                    for k, v in props.items():
+                        if v:
+                            props_lines.append(f"  • {k}: {v}")
+                    if props_lines:
+                        props_text = "<b>성질:</b><br>" + "<br>".join(props_lines)
+                        props_label = QLabel(props_text)
+                        props_label.setWordWrap(True)
+                        group_layout.addWidget(props_label)
+
+                # 관계
+                relationships = fig.get("relationships", [])
+                if relationships:
+                    rel_text = "<b>관계:</b><br>" + "<br>".join(f"  • {r}" for r in relationships)
+                    rel_label = QLabel(rel_text)
+                    rel_label.setWordWrap(True)
+                    group_layout.addWidget(rel_label)
+
+                # 라벨
+                labels = fig.get("labels_in_figure", [])
+                if labels:
+                    labels_label = QLabel(f"<b>라벨:</b> {', '.join(str(l) for l in labels)}")
+                    group_layout.addWidget(labels_label)
+
+                scroll_layout.addWidget(group)
+
+            scroll_layout.addStretch()
+
+            scroll_area = QScrollArea()
+            scroll_area.setWidget(scroll_content)
+            scroll_area.setWidgetResizable(True)
+            figure_layout.addWidget(scroll_area)
+
+            tabs.addTab(figure_tab, "도형 해석")
+
+        # 탭 5: JSON 원본
         json_tab = QWidget()
         json_layout = QVBoxLayout(json_tab)
         json_edit = QTextEdit()
@@ -1157,11 +1175,21 @@ class AnalysisResultDialog(QDialog):
 
         btn_layout.addStretch()
 
+        save_btn = QPushButton("저장 후 닫기")
+        save_btn.clicked.connect(self._save_and_close)
+        save_btn.setStyleSheet("QPushButton { background-color: #4a90d9; color: white; font-weight: bold; padding: 8px 16px; }")
+        btn_layout.addWidget(save_btn)
+
         close_btn = QPushButton("닫기")
-        close_btn.clicked.connect(self.accept)
+        close_btn.clicked.connect(self.close)
         btn_layout.addWidget(close_btn)
 
         layout.addLayout(btn_layout)
+
+    def _save_and_close(self):
+        """결과 저장 후 닫기"""
+        self.result_saved.emit(self.result)
+        self.close()
 
     def _pil_to_qimage(self, pil_image: Image.Image) -> QImage:
         """PIL 이미지를 QImage로 변환"""
