@@ -1,9 +1,10 @@
 -- ============================================================
--- Supabase 스키마: 수학 문제 데이터베이스
+-- Supabase 스키마: 수학 문제 데이터베이스 (v2)
 -- ============================================================
--- 사용법:
--- 1. Supabase 대시보드 → SQL Editor에서 실행
--- 2. 또는 supabase db push 명령어로 적용
+-- 변경사항 (v2):
+-- - 문제와 해설을 하나의 questions 레코드에 통합
+-- - type, linked_question_id 필드 제거
+-- - solution_text, solution_figures 필드 추가
 -- ============================================================
 
 -- pgvector 확장 활성화 (유사 문제 검색용)
@@ -64,7 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_themes_textbook ON themes(textbook_id);
 CREATE INDEX IF NOT EXISTS idx_themes_name ON themes(name);
 
 -- ============================================================
--- 3. questions (문제)
+-- 3. questions (문제 + 해설 통합)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS questions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -73,24 +74,32 @@ CREATE TABLE IF NOT EXISTS questions (
 
     -- 문제 식별
     question_number TEXT,                   -- 문제 번호 (예: "1", "2-1", "가")
-    type TEXT NOT NULL DEFAULT 'question',  -- 'question' 또는 'solution'
-    linked_question_id UUID REFERENCES questions(id) ON DELETE SET NULL,  -- 해설→문제 연결
 
-    -- 본문 내용
+    -- === 문제 본문 ===
     question_text TEXT,                     -- 문제 본문 (LaTeX 포함)
-    answer TEXT,                            -- 정답
+
+    -- === 정답 및 해설 ===
+    answer TEXT,                            -- 정답 (예: "①", "24", "ㄱ, ㄴ")
+    solution_text TEXT,                     -- 해설 본문 (LaTeX 포함)
 
     -- AI 분석 메타데이터
     ai_model_id TEXT,                       -- 분석에 사용된 모델 ID
     ai_model_name TEXT,                     -- 모델 표시명
     ai_model_provider TEXT,                 -- 제공자 (gemini/openai)
 
-    -- 원본 위치 정보
-    source_page INTEGER,                    -- 원본 PDF 페이지
+    -- 원본 위치 정보 (문제)
+    source_page INTEGER,                    -- 문제 원본 PDF 페이지
     bbox_x1 INTEGER,                        -- 바운딩 박스 좌상단 X
     bbox_y1 INTEGER,                        -- 바운딩 박스 좌상단 Y
     bbox_x2 INTEGER,                        -- 바운딩 박스 우하단 X
     bbox_y2 INTEGER,                        -- 바운딩 박스 우하단 Y
+
+    -- 원본 위치 정보 (해설)
+    solution_page INTEGER,                  -- 해설 원본 PDF 페이지
+    solution_bbox_x1 INTEGER,
+    solution_bbox_y1 INTEGER,
+    solution_bbox_x2 INTEGER,
+    solution_bbox_y2 INTEGER,
 
     -- 벡터 임베딩 (유사 문제 검색용)
     -- OpenAI text-embedding-3-small: 1536차원
@@ -105,16 +114,13 @@ CREATE TABLE IF NOT EXISTS questions (
 CREATE INDEX IF NOT EXISTS idx_questions_textbook ON questions(textbook_id);
 CREATE INDEX IF NOT EXISTS idx_questions_theme ON questions(theme_id);
 CREATE INDEX IF NOT EXISTS idx_questions_number ON questions(question_number);
-CREATE INDEX IF NOT EXISTS idx_questions_type ON questions(type);
-CREATE INDEX IF NOT EXISTS idx_questions_linked ON questions(linked_question_id);
 
 -- 벡터 검색 인덱스 (IVFFlat)
--- 참고: 데이터가 충분히 쌓인 후 lists 값 조정 필요 (sqrt(row_count) 권장)
 CREATE INDEX IF NOT EXISTS idx_questions_embedding ON questions
     USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 
 -- ============================================================
--- 4. question_choices (선택지)
+-- 4. question_choices (선택지) - 문제용
 -- ============================================================
 CREATE TABLE IF NOT EXISTS question_choices (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -130,7 +136,7 @@ CREATE TABLE IF NOT EXISTS question_choices (
 CREATE INDEX IF NOT EXISTS idx_question_choices_question ON question_choices(question_id);
 
 -- ============================================================
--- 5. question_sub_items (보기/하위문항)
+-- 5. question_sub_items (보기/하위문항) - 문제용
 -- ============================================================
 CREATE TABLE IF NOT EXISTS question_sub_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -146,7 +152,7 @@ CREATE TABLE IF NOT EXISTS question_sub_items (
 CREATE INDEX IF NOT EXISTS idx_question_sub_items_question ON question_sub_items(question_id);
 
 -- ============================================================
--- 6. question_figures (그래프/도형)
+-- 6. question_figures (그래프/도형) - 문제용
 -- ============================================================
 CREATE TABLE IF NOT EXISTS question_figures (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -175,7 +181,36 @@ CREATE INDEX IF NOT EXISTS idx_question_figures_question ON question_figures(que
 CREATE INDEX IF NOT EXISTS idx_question_figures_type ON question_figures(figure_type);
 
 -- ============================================================
--- 7. key_concepts (핵심 개념)
+-- 7. solution_figures (그래프/도형 해석) - 해설용
+-- ============================================================
+CREATE TABLE IF NOT EXISTS solution_figures (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    question_id UUID NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+
+    -- 도형 유형
+    figure_type TEXT,                       -- function_graph, geometry, number_line, etc.
+
+    -- 위치 (해설 이미지 내 상대 좌표, 0~1)
+    bbox_x1 REAL,
+    bbox_y1 REAL,
+    bbox_x2 REAL,
+    bbox_y2 REAL,
+
+    -- TikZ 코드 (재현용)
+    tikz_code TEXT,
+
+    -- 상세 데이터 (JSONB)
+    figure_data JSONB,
+
+    sort_order INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_solution_figures_question ON solution_figures(question_id);
+CREATE INDEX IF NOT EXISTS idx_solution_figures_type ON solution_figures(figure_type);
+
+-- ============================================================
+-- 8. key_concepts (핵심 개념)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS key_concepts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -190,16 +225,17 @@ CREATE INDEX IF NOT EXISTS idx_key_concepts_question ON key_concepts(question_id
 CREATE INDEX IF NOT EXISTS idx_key_concepts_name ON key_concepts(concept_name);
 
 -- ============================================================
--- 8. 뷰: 문제 전체 정보 조회
+-- 9. 뷰: 문제 전체 정보 조회
 -- ============================================================
 CREATE OR REPLACE VIEW v_questions_full AS
 SELECT
     q.id,
     q.question_number,
-    q.type,
     q.question_text,
     q.answer,
+    q.solution_text,
     q.source_page,
+    q.solution_page,
     q.ai_model_id,
     q.ai_model_provider,
     q.created_at,
@@ -218,11 +254,10 @@ SELECT
 
 FROM questions q
 LEFT JOIN themes t ON q.theme_id = t.id
-JOIN textbooks tb ON q.textbook_id = tb.id
-WHERE q.type = '문제';
+JOIN textbooks tb ON q.textbook_id = tb.id;
 
 -- ============================================================
--- 9. 함수: 유사 문제 검색
+-- 10. 함수: 유사 문제 검색
 -- ============================================================
 CREATE OR REPLACE FUNCTION search_similar_questions(
     query_embedding vector(1536),
@@ -236,6 +271,7 @@ RETURNS TABLE (
     question_number TEXT,
     question_text TEXT,
     answer TEXT,
+    solution_text TEXT,
     textbook_id UUID,
     textbook_title TEXT,
     theme_id UUID,
@@ -251,6 +287,7 @@ BEGIN
         q.question_number,
         q.question_text,
         q.answer,
+        q.solution_text,
         tb.id AS textbook_id,
         tb.title AS textbook_title,
         t.id AS theme_id,
@@ -260,8 +297,7 @@ BEGIN
     JOIN textbooks tb ON q.textbook_id = tb.id
     LEFT JOIN themes t ON q.theme_id = t.id
     WHERE
-        q.type = '문제'
-        AND q.embedding IS NOT NULL
+        q.embedding IS NOT NULL
         AND (filter_textbook_id IS NULL OR q.textbook_id = filter_textbook_id)
         AND (filter_theme_id IS NULL OR q.theme_id = filter_theme_id)
         AND (1 - (q.embedding <=> query_embedding)) > match_threshold
@@ -271,7 +307,7 @@ END;
 $$;
 
 -- ============================================================
--- 10. 트리거: updated_at 자동 갱신
+-- 11. 트리거: updated_at 자동 갱신
 -- ============================================================
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -302,7 +338,8 @@ CREATE TRIGGER update_questions_updated_at
 -- ============================================================
 -- 완료 메시지
 -- ============================================================
--- 스키마 생성 완료!
+-- 스키마 생성 완료! (v2 - 문제+해설 통합)
+--
 -- 다음 단계:
 -- 1. Supabase 대시보드에서 이 SQL 실행
 -- 2. .env 파일에 SUPABASE_URL, SUPABASE_KEY 설정

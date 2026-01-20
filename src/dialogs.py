@@ -1608,8 +1608,9 @@ class AnalysisReviewDialog(QDialog):
             QMessageBox.critical(self, "내보내기 실패", f"파일 저장 중 오류:\n{str(e)}")
 
     def _export_to_supabase(self):
-        """Supabase에 업로드"""
+        """Supabase에 업로드 (문제+해설 통합)"""
         from PyQt5.QtWidgets import QInputDialog, QProgressDialog
+        from .models import BOX_TYPE_SOLUTION
 
         # 교재 정보 입력
         title, ok = QInputDialog.getText(
@@ -1636,10 +1637,19 @@ class AnalysisReviewDialog(QDialog):
             # 테마 데이터 준비
             themes = [{"name": t.name, "color": t.color, "deleted": t.deleted} for t in self.labeler.themes]
 
-            # 문제 데이터 준비
+            # 해설 박스 인덱스 생성 (linked_box_id → solution_box)
+            solution_map = {}  # question_box_id → [(page_idx, solution_box), ...]
+            for page_idx, page_boxes in enumerate(self.labeler.boxes):
+                for box in page_boxes:
+                    if box.box_type == BOX_TYPE_SOLUTION and box.linked_box_id:
+                        if box.linked_box_id not in solution_map:
+                            solution_map[box.linked_box_id] = []
+                        solution_map[box.linked_box_id].append((page_idx, box))
+
+            # 문제 데이터 준비 (문제 + 연결된 해설 통합)
             questions = []
             for page_idx, box, theme_name in self.analyzed_boxes:
-                questions.append({
+                question_data = {
                     "page": page_idx + 1,
                     "x1": box.x1,
                     "y1": box.y1,
@@ -1647,7 +1657,21 @@ class AnalysisReviewDialog(QDialog):
                     "y2": box.y2,
                     "theme_name": theme_name,
                     "ai_result": box.ai_result
-                })
+                }
+
+                # 연결된 해설 찾기
+                linked_solutions = solution_map.get(box.box_id, [])
+                if linked_solutions:
+                    # 첫 번째 해설 사용 (여러 개면 첫 번째)
+                    sol_page_idx, sol_box = linked_solutions[0]
+                    question_data["solution_ai_result"] = sol_box.ai_result
+                    question_data["solution_page"] = sol_page_idx + 1
+                    question_data["solution_x1"] = sol_box.x1
+                    question_data["solution_y1"] = sol_box.y1
+                    question_data["solution_x2"] = sol_box.x2
+                    question_data["solution_y2"] = sol_box.y2
+
+                questions.append(question_data)
 
             progress.setValue(30)
             progress.setLabelText("임베딩 생성 및 업로드 중...")
@@ -1665,11 +1689,14 @@ class AnalysisReviewDialog(QDialog):
             progress.close()
 
             if result.success:
+                # 해설 연결 통계
+                linked_count = sum(1 for q in questions if q.get("solution_ai_result"))
                 QMessageBox.information(
                     self, "업로드 완료",
                     f"Supabase 업로드 완료!\n\n"
                     f"교재: {title}\n"
                     f"문제 수: {result.question_count}개\n"
+                    f"해설 연결: {linked_count}개\n"
                     f"교재 ID: {result.textbook_id[:8]}..."
                 )
             else:
