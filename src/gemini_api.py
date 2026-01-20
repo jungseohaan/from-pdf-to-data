@@ -8,7 +8,6 @@ import re
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-from dotenv import load_dotenv
 from PIL import Image
 from PyQt5.QtCore import QThread, pyqtSignal, QUrl, QRect, QPoint
 from PyQt5.QtWidgets import (
@@ -26,31 +25,31 @@ from .config import (
     generate_prompt_from_schema
 )
 
-# .env 파일 로드 (프로젝트 루트에서 찾기)
-_env_path = Path(__file__).parent.parent / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path)
-else:
-    load_dotenv()
-
 # 클라이언트 캐시
 _gemini_client = None
 _openai_client = None
 
 
+def reset_api_clients():
+    """API 클라이언트 캐시 리셋 (설정 변경 시 호출)"""
+    global _gemini_client, _openai_client
+    _gemini_client = None
+    _openai_client = None
+
+
 def get_api_key(provider: str) -> Optional[str]:
-    """API 키 조회 (설정 파일 → 환경변수 순서)"""
+    """API 키 조회 (.env에서)"""
+    import sys
     settings = load_settings()
+    print(f"[DEBUG] get_api_key({provider}): settings={settings}", file=sys.stderr, flush=True)
     if provider == "gemini":
         key = settings.get("gemini_api_key", "")
-        if not key:
-            key = os.getenv("GEMINI_API_KEY", "")
-        return key if key and key != "your-api-key-here" else None
+        result = key if key and key != "your-gemini-api-key-here" else None
+        print(f"[DEBUG] gemini key: {key[:20] if key else 'None'}..., result: {result is not None}", file=sys.stderr, flush=True)
+        return result
     elif provider == "openai":
         key = settings.get("openai_api_key", "")
-        if not key:
-            key = os.getenv("OPENAI_API_KEY", "")
-        return key if key else None
+        return key if key and key != "your-openai-api-key-here" else None
     return None
 
 

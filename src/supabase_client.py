@@ -3,38 +3,19 @@
 Supabase 연결 및 기본 작업을 위한 싱글톤 클라이언트
 """
 
-import os
 from typing import Optional
-from pathlib import Path
-
-# .env 파일 로드
-from dotenv import load_dotenv
-
-_env_path = Path(__file__).parent.parent / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path)
-else:
-    load_dotenv()
 
 # 싱글톤 클라이언트
 _supabase_client = None
 
 
 def get_supabase_credentials() -> tuple[Optional[str], Optional[str]]:
-    """Supabase 자격 증명 조회 (설정 파일 → 환경변수 순서)"""
+    """Supabase 자격 증명 조회 (.env에서)"""
     from .config import load_settings
 
     settings = load_settings()
-
-    # 설정 파일에서 먼저 확인
     url = settings.get("supabase_url", "")
     key = settings.get("supabase_key", "")
-
-    # 환경변수에서 확인 (여러 변수명 지원)
-    if not url:
-        url = os.getenv("SUPABASE_URL", "") or os.getenv("SUPABASE_PROJECT_URL", "")
-    if not key:
-        key = os.getenv("SUPABASE_KEY", "") or os.getenv("SUPABASE_API_KEY", "")
 
     return (url if url else None, key if key else None)
 

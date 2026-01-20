@@ -60,10 +60,8 @@ def create_embedding(text: str) -> Optional[list[float]]:
 
     # OpenAI API 키 확인
     from .config import load_settings
-    import os
-
     settings = load_settings()
-    api_key = settings.get("openai_api_key", "") or os.getenv("OPENAI_API_KEY", "")
+    api_key = settings.get("openai_api_key", "")
 
     if not api_key:
         print("[WARNING] OpenAI API 키가 설정되지 않았습니다.")
@@ -121,10 +119,8 @@ def create_embeddings_batch(texts: list[str]) -> list[Optional[list[float]]]:
 
     # OpenAI API 키 확인
     from .config import load_settings
-    import os
-
     settings = load_settings()
-    api_key = settings.get("openai_api_key", "") or os.getenv("OPENAI_API_KEY", "")
+    api_key = settings.get("openai_api_key", "")
 
     if not api_key:
         print("[WARNING] OpenAI API 키가 설정되지 않았습니다.")

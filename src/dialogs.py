@@ -318,8 +318,10 @@ class BatchAnalysisDialog(QDialog):
             return
 
         # API 키 확인
+        gemini_key = get_api_key("gemini")
+
         if selected_model_info.provider == "gemini":
-            if not get_api_key("gemini"):
+            if not gemini_key:
                 self.log_edit.append("❌ Gemini API 키가 설정되지 않았습니다.")
                 self.log_edit.append("   설정 메뉴에서 API 키를 입력하거나 .env 파일에 GEMINI_API_KEY를 설정하세요.")
                 return
@@ -349,7 +351,7 @@ class BatchAnalysisDialog(QDialog):
         self.selected_radio.setEnabled(False)
         self.all_radio.setEnabled(False)
         self.theme_radio.setEnabled(False)
-        self.theme_combo.setEnabled(False)
+        self.theme_list.setEnabled(False)
         self.overwrite_checkbox.setEnabled(False)
         self.merge_solutions_checkbox.setEnabled(False)
 
@@ -448,9 +450,9 @@ class BatchAnalysisDialog(QDialog):
             self.selected_radio.setEnabled(True)
         if self.total_boxes > 0:
             self.all_radio.setEnabled(True)
-        if self.theme_combo.count() > 0:
+        if self.theme_list.count() > 0:
             self.theme_radio.setEnabled(True)
-            self.theme_combo.setEnabled(True)
+            self.theme_list.setEnabled(True)
         self.overwrite_checkbox.setEnabled(True)
         self.merge_solutions_checkbox.setEnabled(True)
 

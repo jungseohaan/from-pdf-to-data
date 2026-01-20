@@ -1,15 +1,53 @@
 """설정 관리 모듈"""
 
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 
-# 설정 파일 경로
-CONFIG_DIR = Path(__file__).parent.parent / "config"
-SCHEMA_FILE = CONFIG_DIR / "output_schema.json"
-SOLUTION_SCHEMA_FILE = CONFIG_DIR / "solution_schema.json"
-SETTINGS_FILE = CONFIG_DIR / "settings.json"
+from dotenv import load_dotenv, set_key
+
+# .env 파일 경로 결정
+if getattr(sys, 'frozen', False):
+    # 빌드된 앱: ~/Library/Application Support/PDFLabeler/
+    USER_CONFIG_DIR = Path.home() / "Library" / "Application Support" / "PDFLabeler"
+    USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ENV_FILE = USER_CONFIG_DIR / ".env"
+    # 번들 내 기본 스키마 경로
+    BUNDLE_CONFIG_DIR = Path(sys._MEIPASS) / "config"
+else:
+    # 개발 환경: 프로젝트 루트의 .env
+    USER_CONFIG_DIR = Path(__file__).parent.parent / "config"
+    ENV_FILE = Path(__file__).parent.parent / ".env"
+    BUNDLE_CONFIG_DIR = USER_CONFIG_DIR
+
+CONFIG_DIR = USER_CONFIG_DIR
+SCHEMA_FILE = USER_CONFIG_DIR / "output_schema.json"
+SOLUTION_SCHEMA_FILE = USER_CONFIG_DIR / "solution_schema.json"
+
+# .env 파일 로드
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE)
+else:
+    # .env 파일이 없으면 생성
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ENV_FILE.touch()
+    load_dotenv(ENV_FILE)
+
+# 번들에서 기본 스키마 복사 (없는 경우)
+def _ensure_config_files():
+    """설정 파일이 없으면 기본값 복사"""
+    if getattr(sys, 'frozen', False):
+        for filename in ["output_schema.json", "solution_schema.json"]:
+            user_file = USER_CONFIG_DIR / filename
+            bundle_file = BUNDLE_CONFIG_DIR / filename
+            if not user_file.exists() and bundle_file.exists():
+                import shutil
+                shutil.copy(bundle_file, user_file)
+
+_ensure_config_files()
 
 
 @dataclass
@@ -176,33 +214,40 @@ def save_output_schema(schema: dict) -> bool:
 
 
 def load_settings() -> dict:
-    """설정 로드"""
-    ensure_config_dir()
-    default_settings = {
-        "selected_model": "gemini-2.0-flash-exp",
-        "gemini_api_key": "",
-        "openai_api_key": "",
-        "supabase_url": "",
-        "supabase_key": "",
+    """설정 로드 (.env 환경변수에서)"""
+    # .env 다시 로드 (변경 반영)
+    load_dotenv(ENV_FILE, override=True)
+
+    return {
+        "selected_model": os.getenv("SELECTED_MODEL", "gemini-2.0-flash-exp"),
+        "gemini_api_key": os.getenv("GEMINI_API_KEY", ""),
+        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+        "supabase_url": os.getenv("SUPABASE_URL", ""),
+        "supabase_key": os.getenv("SUPABASE_KEY", ""),
     }
-    if SETTINGS_FILE.exists():
-        try:
-            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
-                default_settings.update(saved)
-        except Exception:
-            pass
-    return default_settings
 
 
 def save_settings(settings: dict) -> bool:
-    """설정 저장"""
-    ensure_config_dir()
+    """설정 저장 (.env 파일에)"""
     try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
+        # 환경변수 이름 매핑
+        env_mapping = {
+            "selected_model": "SELECTED_MODEL",
+            "gemini_api_key": "GEMINI_API_KEY",
+            "openai_api_key": "OPENAI_API_KEY",
+            "supabase_url": "SUPABASE_URL",
+            "supabase_key": "SUPABASE_KEY",
+        }
+
+        for key, env_name in env_mapping.items():
+            if key in settings:
+                value = settings[key] or ""
+                set_key(str(ENV_FILE), env_name, value)
+                os.environ[env_name] = value
+
         return True
-    except Exception:
+    except Exception as e:
+        print(f"설정 저장 실패: {e}", file=sys.stderr)
         return False
 
 

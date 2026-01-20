@@ -307,10 +307,15 @@ class SettingsDialog(QDialog):
         self.settings["supabase_url"] = self.supabase_url_edit.text()
         self.settings["supabase_key"] = self.supabase_key_edit.text()
 
-        # Supabase 클라이언트 리셋 (설정 변경 반영)
+        # API 클라이언트 리셋 (설정 변경 반영)
         try:
             from .supabase_client import reset_supabase_client
             reset_supabase_client()
+        except ImportError:
+            pass
+        try:
+            from .gemini_api import reset_api_clients
+            reset_api_clients()
         except ImportError:
             pass
 
