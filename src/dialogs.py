@@ -1639,12 +1639,28 @@ class AnalysisReviewDialog(QDialog):
 
             # 해설 박스 인덱스 생성 (linked_box_id → solution_box)
             solution_map = {}  # question_box_id → [(page_idx, solution_box), ...]
-            for page_idx, page_boxes in enumerate(self.labeler.boxes):
-                for box in page_boxes:
-                    if box.box_type == BOX_TYPE_SOLUTION and box.linked_box_id:
-                        if box.linked_box_id not in solution_map:
-                            solution_map[box.linked_box_id] = []
-                        solution_map[box.linked_box_id].append((page_idx, box))
+            if hasattr(self.labeler, 'boxes'):
+                boxes = self.labeler.boxes
+                # boxes가 dict인 경우 (page_idx -> boxes)
+                if isinstance(boxes, dict):
+                    for page_idx, page_boxes in boxes.items():
+                        if not isinstance(page_boxes, list):
+                            continue
+                        for box in page_boxes:
+                            if hasattr(box, 'box_type') and box.box_type == BOX_TYPE_SOLUTION and box.linked_box_id:
+                                if box.linked_box_id not in solution_map:
+                                    solution_map[box.linked_box_id] = []
+                                solution_map[box.linked_box_id].append((page_idx, box))
+                # boxes가 list인 경우 (각 요소가 페이지별 박스 리스트)
+                elif isinstance(boxes, list):
+                    for page_idx, page_boxes in enumerate(boxes):
+                        if not isinstance(page_boxes, list):
+                            continue
+                        for box in page_boxes:
+                            if hasattr(box, 'box_type') and box.box_type == BOX_TYPE_SOLUTION and box.linked_box_id:
+                                if box.linked_box_id not in solution_map:
+                                    solution_map[box.linked_box_id] = []
+                                solution_map[box.linked_box_id].append((page_idx, box))
 
             # 문제 데이터 준비 (문제 + 연결된 해설 통합)
             questions = []
@@ -1691,11 +1707,12 @@ class AnalysisReviewDialog(QDialog):
             if result.success:
                 # 해설 연결 통계
                 linked_count = sum(1 for q in questions if q.get("solution_ai_result"))
+                total_count = result.question_count + result.updated_count
                 QMessageBox.information(
                     self, "업로드 완료",
                     f"Supabase 업로드 완료!\n\n"
                     f"교재: {title}\n"
-                    f"문제 수: {result.question_count}개\n"
+                    f"신규: {result.question_count}개 / 업데이트: {result.updated_count}개\n"
                     f"해설 연결: {linked_count}개\n"
                     f"교재 ID: {result.textbook_id[:8]}..."
                 )

@@ -5,6 +5,7 @@
 
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
+import json
 
 
 @dataclass
@@ -13,6 +14,7 @@ class UploadResult:
     success: bool
     textbook_id: Optional[str] = None
     question_count: int = 0
+    updated_count: int = 0  # 업데이트된 문제 수
     error_message: Optional[str] = None
 
 
@@ -88,7 +90,28 @@ class SupabaseSync:
             return UploadResult(False, error_message="Supabase 연결이 설정되지 않았습니다.")
 
         try:
-            # 1. 교재 생성
+            # 1. 교재 조회 또는 생성 (title + source_pdf로 중복 체크)
+            total_pages = 1
+            if isinstance(questions, list) and questions:
+                pages = set()
+                for q in questions:
+                    if isinstance(q, dict):
+                        pages.add(q.get("page", 1))
+                total_pages = len(pages) if pages else 1
+
+            # 기존 교재 검색
+            existing_textbook = None
+            if source_pdf:
+                result = self.client.table("textbooks").select("*").eq("source_pdf", source_pdf).execute()
+                if result.data:
+                    existing_textbook = result.data[0]
+
+            if not existing_textbook:
+                # title로도 검색
+                result = self.client.table("textbooks").select("*").eq("title", title).execute()
+                if result.data:
+                    existing_textbook = result.data[0]
+
             textbook_data = {
                 "title": title,
                 "subtitle": subtitle,
@@ -96,43 +119,79 @@ class SupabaseSync:
                 "year": year,
                 "subject": subject,
                 "source_pdf": source_pdf,
-                "total_pages": len(set(q.get("page", 1) for q in questions))
+                "total_pages": total_pages
             }
 
-            textbook_result = self.client.table("textbooks").insert(textbook_data).execute()
-            textbook_id = textbook_result.data[0]["id"]
+            if existing_textbook:
+                # 기존 교재 업데이트
+                textbook_id = existing_textbook["id"]
+                self.client.table("textbooks").update(textbook_data).eq("id", textbook_id).execute()
+            else:
+                # 새 교재 생성
+                textbook_result = self.client.table("textbooks").insert(textbook_data).execute()
+                textbook_id = textbook_result.data[0]["id"]
 
-            # 2. 테마 생성 (이름 → ID 매핑)
+            # 2. 테마 조회 또는 생성 (이름 → ID 매핑)
             theme_id_map = {}
-            for i, theme in enumerate(themes):
-                if theme.get("deleted"):
-                    continue
+            if isinstance(themes, list):
+                for i, theme in enumerate(themes):
+                    if not isinstance(theme, dict):
+                        continue
+                    if theme.get("deleted"):
+                        continue
 
-                theme_data = {
-                    "textbook_id": textbook_id,
-                    "name": theme["name"],
-                    "color": theme.get("color", "#3498db"),
-                    "sort_order": i
-                }
+                    theme_name = theme.get("name", f"테마{i+1}")
 
-                result = self.client.table("themes").insert(theme_data).execute()
-                theme_id_map[theme["name"]] = result.data[0]["id"]
+                    # 기존 테마 검색
+                    existing_theme = self.client.table("themes").select("*").eq(
+                        "textbook_id", textbook_id
+                    ).eq("name", theme_name).execute()
 
-            # 3. 문제 업로드 (문제 + 해설 통합)
+                    theme_data = {
+                        "textbook_id": textbook_id,
+                        "name": theme_name,
+                        "color": theme.get("color", "#3498db"),
+                        "sort_order": i
+                    }
+
+                    if existing_theme.data:
+                        # 기존 테마 업데이트
+                        theme_id = existing_theme.data[0]["id"]
+                        self.client.table("themes").update(theme_data).eq("id", theme_id).execute()
+                        theme_id_map[theme_name] = theme_id
+                    else:
+                        # 새 테마 생성
+                        result = self.client.table("themes").insert(theme_data).execute()
+                        theme_id_map[theme_name] = result.data[0]["id"]
+
+            # 3. 문제 업로드 (문제 + 해설 통합, upsert 방식)
             from .embedding import create_embedding
 
             question_count = 0
+            updated_count = 0
+            if not isinstance(questions, list):
+                questions = []
+
             for q in questions:
-                ai_result = q.get("ai_result", {})
-                if not ai_result:
+                if not isinstance(q, dict):
                     continue
 
-                content = ai_result.get("content", {})
+                ai_result = q.get("ai_result")
+                if not isinstance(ai_result, dict) or not ai_result:
+                    continue
+
+                content = ai_result.get("content")
+                if not isinstance(content, dict):
+                    content = {}
                 question_text = content.get("question_text", "")
 
                 # 해설 정보
-                solution_ai_result = q.get("solution_ai_result", {})
-                solution_content = solution_ai_result.get("content", {}) if solution_ai_result else {}
+                solution_ai_result = q.get("solution_ai_result")
+                solution_content = {}
+                if isinstance(solution_ai_result, dict):
+                    solution_content = solution_ai_result.get("content", {})
+                    if not isinstance(solution_content, dict):
+                        solution_content = {}
                 solution_text = solution_content.get("solution_text") or solution_content.get("question_text")
 
                 # 임베딩 생성 (문제 텍스트 기준)
@@ -143,16 +202,31 @@ class SupabaseSync:
                 theme_id = theme_id_map.get(theme_name) if theme_name else None
 
                 # 모델 정보
-                model_info = ai_result.get("model", {})
+                model_info = ai_result.get("model")
+                if not isinstance(model_info, dict):
+                    model_info = {}
 
                 # 정답: 문제 분석 결과 또는 해설 분석 결과에서 가져옴
                 answer = content.get("answer") or solution_content.get("answer")
+
+                # 문제 번호와 페이지
+                question_number = str(ai_result.get("question_number")) if ai_result.get("question_number") else None
+                source_page = q.get("page")
+
+                # 기존 문제 검색 (textbook_id + question_number + source_page로 중복 체크)
+                existing_question = None
+                if question_number and source_page:
+                    result = self.client.table("questions").select("id").eq(
+                        "textbook_id", textbook_id
+                    ).eq("question_number", question_number).eq("source_page", source_page).execute()
+                    if result.data:
+                        existing_question = result.data[0]
 
                 # 문제 데이터 (문제 + 해설 통합)
                 question_data = {
                     "textbook_id": textbook_id,
                     "theme_id": theme_id,
-                    "question_number": str(ai_result.get("question_number")) if ai_result.get("question_number") else None,
+                    "question_number": question_number,
                     "question_text": question_text,
                     "answer": answer,
                     "solution_text": solution_text,
@@ -160,7 +234,7 @@ class SupabaseSync:
                     "ai_model_name": model_info.get("name"),
                     "ai_model_provider": model_info.get("provider"),
                     # 문제 위치
-                    "source_page": q.get("page"),
+                    "source_page": source_page,
                     "bbox_x1": q.get("x1"),
                     "bbox_y1": q.get("y1"),
                     "bbox_x2": q.get("x2"),
@@ -174,81 +248,111 @@ class SupabaseSync:
                     "embedding": embedding
                 }
 
-                result = self.client.table("questions").insert(question_data).execute()
-                question_id = result.data[0]["id"]
+                if existing_question:
+                    # 기존 문제 업데이트
+                    question_id = existing_question["id"]
+                    self.client.table("questions").update(question_data).eq("id", question_id).execute()
+
+                    # 기존 하위 데이터 삭제 (재생성 위해)
+                    self.client.table("question_choices").delete().eq("question_id", question_id).execute()
+                    self.client.table("question_sub_items").delete().eq("question_id", question_id).execute()
+                    self.client.table("question_figures").delete().eq("question_id", question_id).execute()
+                    self.client.table("solution_figures").delete().eq("question_id", question_id).execute()
+                    self.client.table("key_concepts").delete().eq("question_id", question_id).execute()
+
+                    updated_count += 1
+                else:
+                    # 새 문제 생성
+                    result = self.client.table("questions").insert(question_data).execute()
+                    question_id = result.data[0]["id"]
+                    question_count += 1
 
                 # 선택지 업로드 (문제용)
-                choices = content.get("choices", [])
-                for i, choice in enumerate(choices):
-                    choice_data = {
-                        "question_id": question_id,
-                        "label": choice.get("label", ""),
-                        "text": choice.get("text", ""),
-                        "sort_order": i
-                    }
-                    self.client.table("question_choices").insert(choice_data).execute()
+                choices = content.get("choices")
+                if isinstance(choices, list):
+                    for i, choice in enumerate(choices):
+                        if isinstance(choice, dict):
+                            choice_data = {
+                                "question_id": question_id,
+                                "label": choice.get("label", ""),
+                                "text": choice.get("text", ""),
+                                "sort_order": i
+                            }
+                            self.client.table("question_choices").insert(choice_data).execute()
 
                 # 보기 업로드 (문제용)
-                sub_questions = content.get("sub_questions", [])
-                for i, sub in enumerate(sub_questions):
-                    sub_data = {
-                        "question_id": question_id,
-                        "label": sub.get("label", ""),
-                        "text": sub.get("text", ""),
-                        "sort_order": i
-                    }
-                    self.client.table("question_sub_items").insert(sub_data).execute()
+                sub_questions = content.get("sub_questions")
+                if isinstance(sub_questions, list):
+                    for i, sub in enumerate(sub_questions):
+                        if isinstance(sub, dict):
+                            sub_data = {
+                                "question_id": question_id,
+                                "label": sub.get("label", ""),
+                                "text": sub.get("text", ""),
+                                "sort_order": i
+                            }
+                            self.client.table("question_sub_items").insert(sub_data).execute()
 
                 # 그래프/도형 업로드 (문제용)
-                figures = content.get("figures", [])
-                for i, figure in enumerate(figures):
-                    bbox = figure.get("bbox_percent", {})
-                    figure_data = {
-                        "question_id": question_id,
-                        "figure_type": figure.get("figure_type"),
-                        "bbox_x1": bbox.get("x1"),
-                        "bbox_y1": bbox.get("y1"),
-                        "bbox_x2": bbox.get("x2"),
-                        "bbox_y2": bbox.get("y2"),
-                        "tikz_code": figure.get("tikz_code"),
-                        "figure_data": figure.get("mathematical_analysis"),
-                        "sort_order": i
-                    }
-                    self.client.table("question_figures").insert(figure_data).execute()
+                figures = content.get("figures")
+                if isinstance(figures, list):
+                    for i, figure in enumerate(figures):
+                        if isinstance(figure, dict):
+                            bbox = figure.get("bbox_percent", {})
+                            if not isinstance(bbox, dict):
+                                bbox = {}
+                            math_analysis = figure.get("mathematical_analysis")
+                            figure_data = {
+                                "question_id": question_id,
+                                "figure_type": figure.get("figure_type"),
+                                "bbox_x1": bbox.get("x1"),
+                                "bbox_y1": bbox.get("y1"),
+                                "bbox_x2": bbox.get("x2"),
+                                "bbox_y2": bbox.get("y2"),
+                                "tikz_code": figure.get("tikz_code"),
+                                "figure_data": json.dumps(math_analysis) if math_analysis else None,
+                                "sort_order": i
+                            }
+                            self.client.table("question_figures").insert(figure_data).execute()
 
                 # 그래프/도형 해석 업로드 (해설용)
-                solution_figures = solution_content.get("figures", [])
-                for i, figure in enumerate(solution_figures):
-                    bbox = figure.get("bbox_percent", {})
-                    figure_data = {
-                        "question_id": question_id,
-                        "figure_type": figure.get("figure_type"),
-                        "bbox_x1": bbox.get("x1"),
-                        "bbox_y1": bbox.get("y1"),
-                        "bbox_x2": bbox.get("x2"),
-                        "bbox_y2": bbox.get("y2"),
-                        "tikz_code": figure.get("tikz_code"),
-                        "figure_data": figure.get("mathematical_analysis"),
-                        "sort_order": i
-                    }
-                    self.client.table("solution_figures").insert(figure_data).execute()
+                solution_figures = solution_content.get("figures")
+                if isinstance(solution_figures, list):
+                    for i, figure in enumerate(solution_figures):
+                        if isinstance(figure, dict):
+                            bbox = figure.get("bbox_percent", {})
+                            if not isinstance(bbox, dict):
+                                bbox = {}
+                            math_analysis = figure.get("mathematical_analysis")
+                            figure_data = {
+                                "question_id": question_id,
+                                "figure_type": figure.get("figure_type"),
+                                "bbox_x1": bbox.get("x1"),
+                                "bbox_y1": bbox.get("y1"),
+                                "bbox_x2": bbox.get("x2"),
+                                "bbox_y2": bbox.get("y2"),
+                                "tikz_code": figure.get("tikz_code"),
+                                "figure_data": json.dumps(math_analysis) if math_analysis else None,
+                                "sort_order": i
+                            }
+                            self.client.table("solution_figures").insert(figure_data).execute()
 
                 # 핵심 개념 업로드
-                key_concepts = content.get("key_concepts", [])
-                for concept in key_concepts:
-                    if concept:
-                        concept_data = {
-                            "question_id": question_id,
-                            "concept_name": concept
-                        }
-                        self.client.table("key_concepts").insert(concept_data).execute()
-
-                question_count += 1
+                key_concepts = content.get("key_concepts")
+                if isinstance(key_concepts, list):
+                    for concept in key_concepts:
+                        if concept and isinstance(concept, str):
+                            concept_data = {
+                                "question_id": question_id,
+                                "concept_name": concept
+                            }
+                            self.client.table("key_concepts").insert(concept_data).execute()
 
             return UploadResult(
                 success=True,
                 textbook_id=textbook_id,
-                question_count=question_count
+                question_count=question_count,
+                updated_count=updated_count
             )
 
         except Exception as e:
