@@ -3,7 +3,7 @@
 문제와 해설을 하나의 레코드로 통합하여 저장
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass
 import json
 
@@ -60,7 +60,8 @@ class SupabaseSync:
         publisher: Optional[str] = None,
         year: Optional[int] = None,
         subject: Optional[str] = None,
-        source_pdf: Optional[str] = None
+        source_pdf: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> UploadResult:
         """교재 전체 업로드
 
@@ -82,6 +83,7 @@ class SupabaseSync:
             year: 출판연도
             subject: 교과목
             source_pdf: 원본 PDF 파일명
+            progress_callback: 진행 상황 콜백 (current, total, message)
 
         Returns:
             UploadResult
@@ -172,7 +174,8 @@ class SupabaseSync:
             if not isinstance(questions, list):
                 questions = []
 
-            for q in questions:
+            total_questions = len(questions)
+            for idx, q in enumerate(questions):
                 if not isinstance(q, dict):
                     continue
 
@@ -261,11 +264,18 @@ class SupabaseSync:
                     self.client.table("key_concepts").delete().eq("question_id", question_id).execute()
 
                     updated_count += 1
+                    action = "업데이트"
                 else:
                     # 새 문제 생성
                     result = self.client.table("questions").insert(question_data).execute()
                     question_id = result.data[0]["id"]
                     question_count += 1
+                    action = "신규"
+
+                # 진행 상황 콜백
+                if progress_callback:
+                    msg = f"[{idx+1}/{total_questions}] 문제 #{question_number or '?'} (p.{source_page}) - {action}"
+                    progress_callback(idx + 1, total_questions, msg)
 
                 # 선택지 업로드 (문제용)
                 choices = content.get("choices")

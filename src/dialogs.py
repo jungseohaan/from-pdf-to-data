@@ -1691,14 +1691,24 @@ class AnalysisReviewDialog(QDialog):
 
             progress.setValue(30)
             progress.setLabelText("임베딩 생성 및 업로드 중...")
+            progress.setMaximum(100)
             QApplication.processEvents()
+
+            # 진행 상황 콜백
+            def on_progress(current: int, total: int, message: str):
+                # 30~95% 구간에서 진행
+                percent = 30 + int((current / total) * 65) if total > 0 else 30
+                progress.setValue(percent)
+                progress.setLabelText(message)
+                QApplication.processEvents()
 
             # 업로드
             result = sync.upload_textbook(
                 title=title,
                 themes=themes,
                 questions=questions,
-                source_pdf=self.labeler.pdf_path.name if self.labeler.pdf_path else None
+                source_pdf=self.labeler.pdf_path.name if self.labeler.pdf_path else None,
+                progress_callback=on_progress
             )
 
             progress.setValue(100)
